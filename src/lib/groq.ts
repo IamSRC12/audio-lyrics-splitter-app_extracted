@@ -89,19 +89,23 @@ async function alignWithLlm(apiKey: string, lyrics: string, whisperTranscription
   }
 
   const client = createGroqClient(apiKey);
-  const prompt = `You are an audio-lyrics alignment assistant. Analyze transcribed audio with timestamps and user-provided lyrics, then create precise audio segments.
+  const prompt = `You are an audio-lyrics alignment assistant. Analyze transcribed audio with timestamps and user-provided lyrics, then create a precise segmentation map that covers the ENTIRE audio duration.
 
 ## TASK
 1. Remove metadata from lyrics such as [Intro], [Outro], [Verse 1], [Chorus], (x2) in ANY language.
-2. Match each cleaned lyric line to the corresponding timestamp in the transcription.
+2. Match each cleaned lyric line to its corresponding timestamp in the transcription.
 3. Identify instrumental/music-only segments between lyric lines.
-4. Create a segmentation map.
+4. Build a contiguous timeline from 0.0 to the end of the audio.
 
 ## RULES
 - Strip ALL structural markers like [Intro], [Verse], [Chorus], (x2), etc. in any language
 - Match lyrics SEMANTICALLY, not just exact word matching
-- Ensure segments do not overlap
-- Mark gaps between lyrics greater than 1 second as "music" segments
+- NEVER merge two lyric lines into one segment — each lyric line MUST be its own segment
+- Mark ANY gap between lyric lines as a "music" segment, no matter how small the gap is (even 0.2s)
+- Segments must NOT overlap
+- Segments MUST be contiguous: each segment's end_time MUST equal the next segment's start_time
+- The FIRST segment must start at 0.0
+- The LAST segment must end at the audio's total duration
 - Start and end times should be precise to 1 decimal place
 - Segments must be in chronological order
 - If there is an intro before the first lyric, mark it as music
@@ -110,20 +114,10 @@ async function alignWithLlm(apiKey: string, lyrics: string, whisperTranscription
 ## OUTPUT FORMAT (JSON ONLY)
 {
   "segments": [
-    {
-      "id": 1,
-      "start_time": 0.0,
-      "end_time": 5.2,
-      "type": "music",
-      "text": "Instrumental"
-    },
-    {
-      "id": 2,
-      "start_time": 5.2,
-      "end_time": 9.8,
-      "type": "lyric",
-      "text": "First line of the song"
-    }
+    { "id": 1, "start_time": 0.0,  "end_time": 5.2,  "type": "music", "text": "Intro" },
+    { "id": 2, "start_time": 5.2,  "end_time": 9.8,  "type": "lyric", "text": "First line of the song" },
+    { "id": 3, "start_time": 9.8,  "end_time": 10.1, "type": "music", "text": "Instrumental" },
+    { "id": 4, "start_time": 10.1, "end_time": 14.5, "type": "lyric", "text": "Second line of the song" }
   ]
 }
 
