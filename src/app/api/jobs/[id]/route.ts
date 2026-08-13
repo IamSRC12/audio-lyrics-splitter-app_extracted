@@ -13,26 +13,36 @@ type RouteContext = {
 };
 
 export async function GET(_request: Request, context: RouteContext) {
-  const { id } = await context.params;
-  const [job] = await db.select().from(jobs).where(eq(jobs.id, id)).limit(1);
-  if (!job) {
-    return Response.json({ error: "Cut not found." }, { status: 404 });
+  try {
+    const { id } = await context.params;
+    const [job] = await db.select().from(jobs).where(eq(jobs.id, id)).limit(1);
+    if (!job) {
+      return Response.json({ error: "Cut not found." }, { status: 404 });
+    }
+
+    const jobSegments = await db.select().from(segments).where(eq(segments.jobId, id));
+    jobSegments.sort((a, b) => a.index - b.index);
+
+    return Response.json({ job: serializeJob(job, jobSegments) });
+  } catch (error) {
+    console.error("Failed to fetch job:", error);
+    return Response.json({ error: "Failed to load cut." }, { status: 500 });
   }
-
-  const jobSegments = await db.select().from(segments).where(eq(segments.jobId, id));
-  jobSegments.sort((a, b) => a.index - b.index);
-
-  return Response.json({ job: serializeJob(job, jobSegments) });
 }
 
 export async function DELETE(_request: Request, context: RouteContext) {
-  const { id } = await context.params;
-  const [job] = await db.select().from(jobs).where(eq(jobs.id, id)).limit(1);
-  if (!job) {
-    return Response.json({ error: "Cut not found." }, { status: 404 });
-  }
+  try {
+    const { id } = await context.params;
+    const [job] = await db.select().from(jobs).where(eq(jobs.id, id)).limit(1);
+    if (!job) {
+      return Response.json({ error: "Cut not found." }, { status: 404 });
+    }
 
-  await db.delete(jobs).where(eq(jobs.id, id));
-  await rm(jobDir(id), { recursive: true, force: true });
-  return Response.json({ ok: true });
+    await db.delete(jobs).where(eq(jobs.id, id));
+    await rm(jobDir(id), { recursive: true, force: true });
+    return Response.json({ ok: true });
+  } catch (error) {
+    console.error("Failed to delete job:", error);
+    return Response.json({ error: "Failed to discard cut." }, { status: 500 });
+  }
 }
