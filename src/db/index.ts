@@ -24,6 +24,10 @@ if (process.env.NODE_ENV !== "production") {
 const realDb = drizzle(pool, { schema });
 const fallbackDb = createFallbackDb();
 
+pool.on("error", () => {
+  globalForDb.__useFallbackDb = true;
+});
+
 function isConnError(err: any): boolean {
   if (!err) return false;
   return (
@@ -34,32 +38,21 @@ function isConnError(err: any): boolean {
   );
 }
 
-function wrapDrizzleQuery(getRealQuery: () => any, getFallbackQuery: () => any): any {
-  let target: any;
-  try {
-    target = getRealQuery();
-  } catch (err) {
-    if (isConnError(err)) {
-      globalForDb.__useFallbackDb = true;
-      return getFallbackQuery();
-    }
-    throw err;
+function wrapQuery(builderObj: any, getFallbackQuery: () => any): any {
+  if (!builderObj || (typeof builderObj !== "object" && typeof builderObj !== "function")) {
+    return builderObj;
   }
 
-  if (!target || (typeof target !== "object" && typeof target !== "function")) {
-    return target;
-  }
-
-  return new Proxy(target, {
-    get(obj, prop, receiver) {
+  return new Proxy(builderObj, {
+    get(target, prop, receiver) {
       if (prop === "then") {
         return function (onFulfilled?: any, onRejected?: any) {
-          return Promise.resolve(obj)
+          return Promise.resolve(target)
             .catch((err) => {
               if (isConnError(err)) {
                 globalForDb.__useFallbackDb = true;
-                const fallbackQuery = getFallbackQuery();
-                return fallbackQuery;
+                const fb = getFallbackQuery();
+                return fb;
               }
               throw err;
             })
@@ -67,22 +60,35 @@ function wrapDrizzleQuery(getRealQuery: () => any, getFallbackQuery: () => any):
         };
       }
 
-      const val = Reflect.get(obj, prop, receiver);
+      const val = Reflect.get(target, prop, receiver);
       if (typeof val === "function") {
         return function (...args: any[]) {
-          return wrapDrizzleQuery(
-            () => val.apply(obj, args),
-            () => {
+          let nextTarget: any;
+          try {
+            nextTarget = val.apply(target, args);
+          } catch (err) {
+            if (isConnError(err)) {
+              globalForDb.__useFallbackDb = true;
               const fb = getFallbackQuery();
-              const fbMethod = fb[prop];
-              if (typeof fbMethod === "function") {
-                return fbMethod.apply(fb, args);
-              }
+              const fbProp = fb[prop];
+              if (typeof fbProp === "function") return fbProp.apply(fb, args);
               return fb;
             }
-          );
+            throw err;
+          }
+
+          if (nextTarget && (typeof nextTarget === "object" || typeof nextTarget === "function")) {
+            return wrapQuery(nextTarget, () => {
+              const fb = getFallbackQuery();
+              const fbProp = fb[prop];
+              if (typeof fbProp === "function") return fbProp.apply(fb, args);
+              return fb;
+            });
+          }
+          return nextTarget;
         };
       }
+
       return val;
     },
   });
@@ -91,22 +97,52 @@ function wrapDrizzleQuery(getRealQuery: () => any, getFallbackQuery: () => any):
 export const db: any = {
   select(...args: any[]) {
     if (globalForDb.__useFallbackDb) return fallbackDb.select(...args);
-    return wrapDrizzleQuery(() => realDb.select(...args), () => fallbackDb.select(...args));
+    try {
+      const q = realDb.select(...args);
+      return wrapQuery(q, () => fallbackDb.select(...args));
+    } catch {
+      globalForDb.__useFallbackDb = true;
+      return fallbackDb.select(...args);
+    }
   },
   insert(...args: any[]) {
     if (globalForDb.__useFallbackDb) return fallbackDb.insert(...args);
-    return wrapDrizzleQuery(() => realDb.insert(...args), () => fallbackDb.insert(...args));
+    try {
+      const q = realDb.insert(...args);
+      return wrapQuery(q, () => fallbackDb.insert(...args));
+    } catch {
+      globalForDb.__useFallbackDb = true;
+      return fallbackDb.insert(...args);
+    }
   },
   update(...args: any[]) {
     if (globalForDb.__useFallbackDb) return fallbackDb.update(...args);
-    return wrapDrizzleQuery(() => realDb.update(...args), () => fallbackDb.update(...args));
+    try {
+      const q = realDb.update(...args);
+      return wrapQuery(q, () => fallbackDb.update(...args));
+    } catch {
+      globalForDb.__useFallbackDb = true;
+      return fallbackDb.update(...args);
+    }
   },
   delete(...args: any[]) {
     if (globalForDb.__useFallbackDb) return fallbackDb.delete(...args);
-    return wrapDrizzleQuery(() => realDb.delete(...args), () => fallbackDb.delete(...args));
+    try {
+      const q = realDb.delete(...args);
+      return wrapQuery(q, () => fallbackDb.delete(...args));
+    } catch {
+      globalForDb.__useFallbackDb = true;
+      return fallbackDb.delete(...args);
+    }
   },
   execute(...args: any[]) {
     if (globalForDb.__useFallbackDb) return fallbackDb.execute(...args);
-    return wrapDrizzleQuery(() => realDb.execute(...args), () => fallbackDb.execute(...args));
+    try {
+      const q = realDb.execute(...args);
+      return wrapQuery(q, () => fallbackDb.execute(...args));
+    } catch {
+      globalForDb.__useFallbackDb = true;
+      return fallbackDb.execute(...args);
+    }
   },
 };

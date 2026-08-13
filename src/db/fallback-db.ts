@@ -77,6 +77,47 @@ export function createFallbackDb() {
       let whereClause: any = null;
       let orderClause: any = null;
 
+      const executeSelect = () => {
+        const store = readStore();
+        let list = [...store[targetTable]] as any[];
+        const filter = extractFilter(whereClause);
+
+        if (filter.key && filter.val !== undefined) {
+          list = list.filter((item) => {
+            if (filter.key === "id") return item.id === filter.val;
+            if (filter.key === "job_id" || filter.key === "jobId") return item.jobId === filter.val;
+            return true;
+          });
+        }
+
+        if (orderClause) {
+          list.sort((a, b) => {
+            if (targetTable === "jobs") {
+              return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+            }
+            if (targetTable === "segments") {
+              return (a.index ?? 0) - (b.index ?? 0);
+            }
+            return 0;
+          });
+        }
+
+        if (selection && typeof selection === "object") {
+          const keys = Object.keys(selection);
+          if (keys.length > 0) {
+            list = list.map((item) => {
+              const projected: any = {};
+              for (const key of keys) {
+                projected[key] = item[key];
+              }
+              return projected;
+            });
+          }
+        }
+
+        return list;
+      };
+
       const chain = {
         from(t: any) {
           targetTable = getTableName(t);
@@ -90,45 +131,23 @@ export function createFallbackDb() {
           orderClause = o;
           return chain;
         },
-        then(resolve: (val: any) => void) {
-          const store = readStore();
-          let list = [...store[targetTable]] as any[];
-          const filter = extractFilter(whereClause);
-
-          if (filter.key && filter.val !== undefined) {
-            list = list.filter((item) => {
-              if (filter.key === "id") return item.id === filter.val;
-              if (filter.key === "job_id" || filter.key === "jobId") return item.jobId === filter.val;
-              return true;
-            });
+        limit() {
+          return chain;
+        },
+        returning() {
+          return chain;
+        },
+        then(resolve: (val: any) => void, reject?: (err: any) => void) {
+          try {
+            const res = executeSelect();
+            resolve(res);
+          } catch (err) {
+            if (reject) reject(err);
+            else throw err;
           }
-
-          if (orderClause) {
-            list.sort((a, b) => {
-              if (targetTable === "jobs") {
-                return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
-              }
-              if (targetTable === "segments") {
-                return (a.index ?? 0) - (b.index ?? 0);
-              }
-              return 0;
-            });
-          }
-
-          if (selection && typeof selection === "object") {
-            const keys = Object.keys(selection);
-            if (keys.length > 0) {
-              list = list.map((item) => {
-                const projected: any = {};
-                for (const key of keys) {
-                  projected[key] = item[key];
-                }
-                return projected;
-              });
-            }
-          }
-
-          resolve(list);
+        },
+        catch(reject: (err: any) => void) {
+          return chain.then((x) => x, reject);
         },
       };
 
@@ -139,6 +158,35 @@ export function createFallbackDb() {
       const targetTable = getTableName(t);
       let valuesToInsert: any = null;
 
+      const executeInsert = () => {
+        const store = readStore();
+        const items = Array.isArray(valuesToInsert) ? valuesToInsert : [valuesToInsert];
+        const now = new Date();
+        const inserted: any[] = [];
+
+        for (const rawItem of items) {
+          const item = { ...rawItem };
+          if (!item.id) {
+            item.id = crypto.randomUUID();
+          }
+          if (!item.createdAt) {
+            item.createdAt = now;
+          }
+          if (!item.updatedAt && targetTable === "jobs") {
+            item.updatedAt = now;
+          }
+          if (targetTable === "jobs") {
+            if (item.segmentsCount === undefined) item.segmentsCount = 0;
+            if (item.status === undefined) item.status = "uploaded";
+          }
+          store[targetTable].push(item);
+          inserted.push(item);
+        }
+
+        writeStore(store);
+        return inserted;
+      };
+
       const chain = {
         values(v: any) {
           valuesToInsert = v;
@@ -147,33 +195,20 @@ export function createFallbackDb() {
         returning() {
           return chain;
         },
-        then(resolve: (val: any) => void) {
-          const store = readStore();
-          const items = Array.isArray(valuesToInsert) ? valuesToInsert : [valuesToInsert];
-          const now = new Date();
-          const inserted: any[] = [];
-
-          for (const rawItem of items) {
-            const item = { ...rawItem };
-            if (!item.id) {
-              item.id = crypto.randomUUID();
-            }
-            if (!item.createdAt) {
-              item.createdAt = now;
-            }
-            if (!item.updatedAt && targetTable === "jobs") {
-              item.updatedAt = now;
-            }
-            if (targetTable === "jobs") {
-              if (item.segmentsCount === undefined) item.segmentsCount = 0;
-              if (item.status === undefined) item.status = "uploaded";
-            }
-            store[targetTable].push(item);
-            inserted.push(item);
+        onConflictDoUpdate() {
+          return chain;
+        },
+        then(resolve: (val: any) => void, reject?: (err: any) => void) {
+          try {
+            const res = executeInsert();
+            resolve(res);
+          } catch (err) {
+            if (reject) reject(err);
+            else throw err;
           }
-
-          writeStore(store);
-          resolve(inserted);
+        },
+        catch(reject: (err: any) => void) {
+          return chain.then((x) => x, reject);
         },
       };
 
@@ -185,6 +220,34 @@ export function createFallbackDb() {
       let setValues: any = null;
       let whereClause: any = null;
 
+      const executeUpdate = () => {
+        const store = readStore();
+        const filter = extractFilter(whereClause);
+        const now = new Date();
+        const updated: any[] = [];
+
+        store[targetTable] = store[targetTable].map((item: any) => {
+          let matches = false;
+          if (!filter.key) {
+            matches = true;
+          } else if (filter.key === "id" && item.id === filter.val) {
+            matches = true;
+          } else if ((filter.key === "job_id" || filter.key === "jobId") && item.jobId === filter.val) {
+            matches = true;
+          }
+
+          if (matches) {
+            const next = { ...item, ...setValues, updatedAt: now };
+            updated.push(next);
+            return next;
+          }
+          return item;
+        });
+
+        writeStore(store);
+        return updated;
+      };
+
       const chain = {
         set(v: any) {
           setValues = v;
@@ -194,27 +257,20 @@ export function createFallbackDb() {
           whereClause = w;
           return chain;
         },
-        then(resolve: (val: any) => void) {
-          const store = readStore();
-          const filter = extractFilter(whereClause);
-          const now = new Date();
-          const updated: any[] = [];
-
-          store[targetTable] = store[targetTable].map((item: any) => {
-            let matches = false;
-            if (filter.key === "id" && item.id === filter.val) matches = true;
-            if ((filter.key === "job_id" || filter.key === "jobId") && item.jobId === filter.val) matches = true;
-
-            if (matches) {
-              const next = { ...item, ...setValues, updatedAt: now };
-              updated.push(next);
-              return next;
-            }
-            return item;
-          });
-
-          writeStore(store);
-          resolve(updated);
+        returning() {
+          return chain;
+        },
+        then(resolve: (val: any) => void, reject?: (err: any) => void) {
+          try {
+            const res = executeUpdate();
+            resolve(res);
+          } catch (err) {
+            if (reject) reject(err);
+            else throw err;
+          }
+        },
+        catch(reject: (err: any) => void) {
+          return chain.then((x) => x, reject);
         },
       };
 
@@ -225,23 +281,39 @@ export function createFallbackDb() {
       const targetTable = getTableName(t);
       let whereClause: any = null;
 
+      const executeDelete = () => {
+        const store = readStore();
+        const filter = extractFilter(whereClause);
+
+        store[targetTable] = store[targetTable].filter((item: any) => {
+          if (filter.key === "id" && item.id === filter.val) return false;
+          if ((filter.key === "job_id" || filter.key === "jobId") && item.jobId === filter.val) return false;
+          return true;
+        });
+
+        writeStore(store);
+        return [];
+      };
+
       const chain = {
         where(w: any) {
           whereClause = w;
           return chain;
         },
-        then(resolve: (val: any) => void) {
-          const store = readStore();
-          const filter = extractFilter(whereClause);
-
-          store[targetTable] = store[targetTable].filter((item: any) => {
-            if (filter.key === "id" && item.id === filter.val) return false;
-            if ((filter.key === "job_id" || filter.key === "jobId") && item.jobId === filter.val) return false;
-            return true;
-          });
-
-          writeStore(store);
-          resolve([]);
+        returning() {
+          return chain;
+        },
+        then(resolve: (val: any) => void, reject?: (err: any) => void) {
+          try {
+            const res = executeDelete();
+            resolve(res);
+          } catch (err) {
+            if (reject) reject(err);
+            else throw err;
+          }
+        },
+        catch(reject: (err: any) => void) {
+          return chain.then((x) => x, reject);
         },
       };
 
