@@ -1,4 +1,18 @@
 {
-  "jobs": [],
+  "jobs": [
+    {
+      "title": "When You Left   Four in the Morning   Treblo",
+      "originalFilename": "When You Left - Four in the Morning - Treblo.mp3",
+      "mimeType": "audio/mpeg",
+      "filePath": "pending",
+      "lyrics": "[Verse 1]\r\nFour in the morning\r\nAnd I'm still wide awake\r\nCounting the cracks in the ceiling\r\nLike they're my last mistake\r\n\r\nI traced your name on the window\r\nBut the fog had faded away\r\nGuess I'm holding on to nothing\r\nThe way I always do\r\n\r\n[Pre-Chorus]\r\nAnd I don't know why I keep calling\r\nWhen the line's already dead\r\n\r\n[Chorus]\r\nYou took the light with you when you left\r\nLeft me here in the quiet\r\nHeavy heart and hollow chest\r\nAnd I'm still trying to deny it\r\nYou took the light with you when you left\r\n\r\n[Post-Chorus]\r\nWhen you left\r\nWhen you left\r\n\r\n[Verse 2]\r\nYour sweater still in the closet\r\nSmells like you on rainy days\r\nI wear it when I get lonely\r\nLike a ghost I can't erase\r\n\r\nI scroll through all of our pictures\r\nTil my thumb starts to ache\r\nEvery smile feels like a stranger\r\nFrom a life I couldn't save\r\n\r\n[Pre-Chorus]\r\nAnd I don't know why I keep hoping\r\nWhen there's nothing left to say\r\n\r\n[Chorus]\r\nYou took the light with you when you left\r\nLeft me here in the quiet\r\nHeavy heart and hollow chest\r\nAnd I'm still trying to deny it\r\nYou took the light with you when you left\r\n\r\n[Post-Chorus]\r\nWhen you left\r\nWhen you left\r\n\r\n[Bridge]\r\nMaybe someday I'll stop counting\r\nMaybe someday I'll forget\r\nBut tonight I'm just a shadow\r\nOf a person I regret\r\n\r\n[Chorus]\r\nYou took the light with you when you left\r\nLeft me here in the quiet\r\nHeavy heart and hollow chest\r\nAnd I'm still trying to deny it\r\nYou took the light with you when you left",
+      "status": "uploaded",
+      "error": null,
+      "id": "3f9c7da1-d10e-408c-a2de-feba31cc8620",
+      "createdAt": "2026-08-13T04:19:17.109Z",
+      "updatedAt": "2026-08-13T04:19:17.109Z",
+      "segmentsCount": 0
+    }
+  ],
   "segments": []
 }
