@@ -14,6 +14,16 @@ type StudioAppProps = {
 const ACCEPT = ".mp3,.wav,.ogg,.m4a,.flac,.webm,.mp4";
 const ACTIVE_STATUSES: JobStatus[] = ["uploaded", "transcribing", "aligning", "splitting"];
 
+async function safeJson<T>(response: Response): Promise<T> {
+  const text = await response.text();
+  if (!text) return {} as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return {} as T;
+  }
+}
+
 export function StudioApp({ initialJobs, groqConfigured }: StudioAppProps) {
   const [jobs, setJobs] = useState(initialJobs);
   const [activeJob, setActiveJob] = useState<SerializedJob | null>(null);
@@ -61,9 +71,11 @@ export function StudioApp({ initialJobs, groqConfigured }: StudioAppProps) {
     const timer = window.setInterval(async () => {
       const response = await fetch(`/api/jobs/${activeId}`, { cache: "no-store" });
       if (!response.ok) return;
-      const payload = (await response.json()) as { job: SerializedJob };
-      setActiveJob(payload.job);
-      setJobs((current) => current.map((job) => (job.id === payload.job.id ? payload.job : job)));
+      const payload = await safeJson<{ job?: SerializedJob }>(response);
+      if (payload.job) {
+        setActiveJob(payload.job);
+        setJobs((current) => current.map((job) => (job.id === payload.job!.id ? payload.job! : job)));
+      }
     }, 1400);
 
     return () => window.clearInterval(timer);
@@ -127,7 +139,7 @@ export function StudioApp({ initialJobs, groqConfigured }: StudioAppProps) {
         body,
         headers: apiKey.trim() ? { "x-groq-api-key": apiKey.trim() } : undefined,
       });
-      const payload = (await response.json()) as { job?: SerializedJob; error?: string };
+      const payload = await safeJson<{ job?: SerializedJob; error?: string }>(response);
       if (!response.ok || !payload.job) {
         throw new Error(payload.error || "The booth could not take the reel.");
       }
@@ -143,11 +155,13 @@ export function StudioApp({ initialJobs, groqConfigured }: StudioAppProps) {
   async function loadJob(id: string) {
     const response = await fetch(`/api/jobs/${id}`, { cache: "no-store" });
     if (!response.ok) return;
-    const payload = (await response.json()) as { job: SerializedJob };
-    setActiveJob(payload.job);
-    setLyrics(payload.job.lyrics);
-    setTitle(payload.job.title);
-    setLibraryOpen(false);
+    const payload = await safeJson<{ job?: SerializedJob }>(response);
+    if (payload.job) {
+      setActiveJob(payload.job);
+      setLyrics(payload.job.lyrics);
+      setTitle(payload.job.title);
+      setLibraryOpen(false);
+    }
   }
 
   async function retryJob() {
@@ -156,7 +170,7 @@ export function StudioApp({ initialJobs, groqConfigured }: StudioAppProps) {
       method: "POST",
       headers: apiKey.trim() ? { "x-groq-api-key": apiKey.trim() } : undefined,
     });
-    const payload = (await response.json()) as { job?: SerializedJob; error?: string };
+    const payload = await safeJson<{ job?: SerializedJob; error?: string }>(response);
     if (!response.ok || !payload.job) {
       setError(payload.error || "Could not restart the cut.");
       return;
