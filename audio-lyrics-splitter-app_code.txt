@@ -1,0 +1,2452 @@
+================================================================================
+FILE PATH: drizzle.config.json
+================================================================================
+{
+  "dialect": "postgresql",
+  "schema": "./src/db/schema.ts",
+  "dbCredentials": {
+    "url": "postgresql://postgres:postgres@127.0.0.1:5432/app_db"
+  }
+}
+
+
+================================================================================
+FILE PATH: eslint.config.mjs
+================================================================================
+import { defineConfig, globalIgnores } from "eslint/config";
+import nextCoreWebVitals from "eslint-config-next/core-web-vitals";
+
+export default defineConfig([
+  // Keep the starter on the flat config export that actually runs under the pinned ESLint/Next toolchain.
+  ...nextCoreWebVitals,
+  globalIgnores([".next/**", "out/**", "build/**", "next-env.d.ts"]),
+]);
+
+
+================================================================================
+FILE PATH: next.config.ts
+================================================================================
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  serverExternalPackages: ["ffmpeg-static", "groq-sdk", "music-metadata"],
+};
+
+export default nextConfig;
+
+
+================================================================================
+FILE PATH: package.json
+================================================================================
+{
+  "name": "nextjs-postgresql-template",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "17.3.1",
+    "drizzle-orm": "0.45.2",
+    "ffmpeg-static": "^5.3.0",
+    "groq-sdk": "^1.5.0",
+    "jszip": "^3.10.1",
+    "music-metadata": "^11.14.0",
+    "next": "16.2.6",
+    "pg": "8.20.0",
+    "react": "19.2.6",
+    "react-dom": "19.2.6"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.1.17",
+    "@types/node": "22.19.15",
+    "@types/pg": "8.18.0",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "drizzle-kit": "0.31.10",
+    "eslint": "9.39.4",
+    "eslint-config-next": "16.2.6",
+    "postcss": "8.5.8",
+    "tailwindcss": "4.1.17",
+    "typescript": "5.9.3"
+  }
+}
+
+
+================================================================================
+FILE PATH: postcss.config.mjs
+================================================================================
+const postcssConfig = {
+  plugins: {
+    "@tailwindcss/postcss": {},
+  },
+};
+
+export default postcssConfig;
+
+
+================================================================================
+FILE PATH: src\app\api\health\route.ts
+================================================================================
+import { db } from "@/db";
+import { sql } from "drizzle-orm";
+
+export const dynamic = "force-dynamic";
+
+export async function GET() {
+  try {
+    await db.execute(sql`select 1`);
+    return Response.json({ ok: true });
+  } catch {
+    return Response.json({ ok: false }, { status: 500 });
+  }
+}
+
+
+================================================================================
+FILE PATH: src\app\api\jobs\route.ts
+================================================================================
+import { writeFile } from "fs/promises";
+import path from "path";
+import { desc, eq } from "drizzle-orm";
+import { db } from "@/db";
+import { jobs } from "@/db/schema";
+import { resolveGroqApiKey } from "@/lib/groq";
+import { ensureJobDirs, extensionOf, jobDir, titleFromFilename } from "@/lib/paths";
+import { processJob } from "@/lib/process-job";
+import { serializeJob } from "@/lib/serialize";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const maxDuration = 300;
+
+const MAX_BYTES = 50 * 1024 * 1024;
+const ALLOWED_EXTENSIONS = new Set(["mp3", "wav", "ogg", "m4a", "flac", "webm", "mp4", "mpeg"]);
+
+export async function GET() {
+  const rows = await db.select().from(jobs).orderBy(desc(jobs.createdAt)).limit(30);
+  return Response.json({ jobs: rows.map((row) => serializeJob(row)) });
+}
+
+export async function POST(request: Request) {
+  const formData = await request.formData();
+  const audio = formData.get("audio");
+  const lyricsValue = formData.get("lyrics");
+  const titleValue = formData.get("title");
+
+  if (!(audio instanceof File)) {
+    return Response.json({ error: "Upload an audio file to begin." }, { status: 400 });
+  }
+
+  const lyrics = typeof lyricsValue === "string" ? lyricsValue.trim() : "";
+  if (!lyrics) {
+    return Response.json({ error: "Paste the song lyrics before cutting." }, { status: 400 });
+  }
+
+  if (audio.size > MAX_BYTES) {
+    return Response.json({ error: "Audio must be 50MB or smaller." }, { status: 400 });
+  }
+
+  const extension = extensionOf(audio.name);
+  if (!ALLOWED_EXTENSIONS.has(extension)) {
+    return Response.json({ error: "Use MP3, WAV, OGG, M4A, FLAC or WEBM." }, { status: 400 });
+  }
+
+  const apiKey = resolveGroqApiKey(request);
+  const title =
+    (typeof titleValue === "string" && titleValue.trim()) || titleFromFilename(audio.name);
+
+  const [created] = await db
+    .insert(jobs)
+    .values({
+      title,
+      originalFilename: audio.name,
+      mimeType: audio.type || `audio/${extension}`,
+      filePath: "pending",
+      lyrics,
+      status: apiKey ? "uploaded" : "failed",
+      error: apiKey ? null : "Add a Groq API key to transcribe and align this track.",
+    })
+    .returning();
+
+  if (!created) {
+    return Response.json({ error: "Could not create the job." }, { status: 500 });
+  }
+
+  await ensureJobDirs(created.id);
+  const filePath = path.join(jobDir(created.id), `original.${extension}`);
+  await writeFile(filePath, Buffer.from(await audio.arrayBuffer()));
+
+  const [saved] = await db
+    .update(jobs)
+    .set({ filePath, updatedAt: new Date() })
+    .where(eq(jobs.id, created.id))
+    .returning();
+
+  const job = saved ?? { ...created, filePath };
+
+  if (apiKey) {
+    void processJob(job.id, apiKey);
+  }
+
+  return Response.json({ job: serializeJob(job) }, { status: 201 });
+}
+
+
+================================================================================
+FILE PATH: src\app\api\jobs\[id]\audio\route.ts
+================================================================================
+import { createReadStream } from "fs";
+import { stat } from "fs/promises";
+import { Readable } from "stream";
+import { eq } from "drizzle-orm";
+import { db } from "@/db";
+import { jobs } from "@/db/schema";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+type RouteContext = {
+  params: Promise<{ id: string }>;
+};
+
+export async function GET(_request: Request, context: RouteContext) {
+  const { id } = await context.params;
+  const [job] = await db.select().from(jobs).where(eq(jobs.id, id)).limit(1);
+  if (!job) {
+    return Response.json({ error: "Cut not found." }, { status: 404 });
+  }
+
+  try {
+    const info = await stat(job.filePath);
+    const stream = createReadStream(job.filePath);
+    return new Response(Readable.toWeb(stream) as ReadableStream, {
+      headers: {
+        "Content-Type": job.mimeType || "audio/mpeg",
+        "Content-Length": String(info.size),
+        "Content-Disposition": `inline; filename="${job.originalFilename}"`,
+        "Cache-Control": "private, max-age=3600",
+      },
+    });
+  } catch {
+    return Response.json({ error: "Original audio is no longer on disk." }, { status: 404 });
+  }
+}
+
+
+================================================================================
+FILE PATH: src\app\api\jobs\[id]\download\route.ts
+================================================================================
+import { readFile } from "fs/promises";
+import { eq } from "drizzle-orm";
+import { db } from "@/db";
+import { jobs, segments } from "@/db/schema";
+import { collectExistingSplits, createZipFromFiles, splitAudio } from "@/lib/audio";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const maxDuration = 300;
+
+type RouteContext = {
+  params: Promise<{ id: string }>;
+};
+
+export async function GET(_request: Request, context: RouteContext) {
+  const { id } = await context.params;
+  const [job] = await db.select().from(jobs).where(eq(jobs.id, id)).limit(1);
+  if (!job) {
+    return Response.json({ error: "Cut not found." }, { status: 404 });
+  }
+
+  let zipPath = job.zipPath;
+  if (!zipPath) {
+    const existing = await collectExistingSplits(id);
+    if (existing.length > 0) {
+      zipPath = await createZipFromFiles(id, existing, "segments.zip");
+    } else {
+      const jobSegments = await db.select().from(segments).where(eq(segments.jobId, id));
+      if (jobSegments.length === 0) {
+        return Response.json({ error: "This cut has no downloadable segments yet." }, { status: 404 });
+      }
+      const files = await splitAudio(
+        id,
+        job.filePath,
+        jobSegments
+          .sort((a, b) => a.index - b.index)
+          .map((segment) => ({
+            id: segment.index,
+            start_time: segment.startTime,
+            end_time: segment.endTime,
+            type: segment.type === "music" ? "music" : "lyric",
+            text: segment.text,
+          })),
+      );
+      zipPath = await createZipFromFiles(id, files, "segments.zip");
+    }
+
+    await db.update(jobs).set({ zipPath, updatedAt: new Date() }).where(eq(jobs.id, id));
+  }
+
+  const buffer = await readFile(zipPath);
+  const filename = `${job.title.replace(/[^\w.-]+/g, "_") || "cutline"}_segments.zip`;
+
+  return new Response(buffer, {
+    headers: {
+      "Content-Type": "application/zip",
+      "Content-Disposition": `attachment; filename="${filename}"`,
+      "Content-Length": String(buffer.byteLength),
+    },
+  });
+}
+
+
+================================================================================
+FILE PATH: src\app\api\jobs\[id]\process\route.ts
+================================================================================
+import { eq } from "drizzle-orm";
+import { db } from "@/db";
+import { jobs, segments } from "@/db/schema";
+import { resolveGroqApiKey } from "@/lib/groq";
+import { processJob } from "@/lib/process-job";
+import { serializeJob } from "@/lib/serialize";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const maxDuration = 300;
+
+type RouteContext = {
+  params: Promise<{ id: string }>;
+};
+
+export async function POST(request: Request, context: RouteContext) {
+  const { id } = await context.params;
+  const [job] = await db.select().from(jobs).where(eq(jobs.id, id)).limit(1);
+  if (!job) {
+    return Response.json({ error: "Cut not found." }, { status: 404 });
+  }
+
+  const apiKey = resolveGroqApiKey(request);
+  if (!apiKey) {
+    return Response.json({ error: "A Groq API key is required." }, { status: 400 });
+  }
+
+  if (["transcribing", "aligning", "splitting"].includes(job.status)) {
+    const jobSegments = await db.select().from(segments).where(eq(segments.jobId, id));
+    return Response.json({ job: serializeJob(job, jobSegments) });
+  }
+
+  void processJob(id, apiKey);
+  return Response.json({
+    job: serializeJob({ ...job, status: "uploaded", error: null }),
+  });
+}
+
+
+================================================================================
+FILE PATH: src\app\api\jobs\[id]\route.ts
+================================================================================
+import { rm } from "fs/promises";
+import { eq } from "drizzle-orm";
+import { db } from "@/db";
+import { jobs, segments } from "@/db/schema";
+import { jobDir } from "@/lib/paths";
+import { serializeJob } from "@/lib/serialize";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+type RouteContext = {
+  params: Promise<{ id: string }>;
+};
+
+export async function GET(_request: Request, context: RouteContext) {
+  const { id } = await context.params;
+  const [job] = await db.select().from(jobs).where(eq(jobs.id, id)).limit(1);
+  if (!job) {
+    return Response.json({ error: "Cut not found." }, { status: 404 });
+  }
+
+  const jobSegments = await db.select().from(segments).where(eq(segments.jobId, id));
+  jobSegments.sort((a, b) => a.index - b.index);
+
+  return Response.json({ job: serializeJob(job, jobSegments) });
+}
+
+export async function DELETE(_request: Request, context: RouteContext) {
+  const { id } = await context.params;
+  const [job] = await db.select().from(jobs).where(eq(jobs.id, id)).limit(1);
+  if (!job) {
+    return Response.json({ error: "Cut not found." }, { status: 404 });
+  }
+
+  await db.delete(jobs).where(eq(jobs.id, id));
+  await rm(jobDir(id), { recursive: true, force: true });
+  return Response.json({ ok: true });
+}
+
+
+================================================================================
+FILE PATH: src\app\api\jobs\[id]\segments\[segmentId]\route.ts
+================================================================================
+import { createReadStream } from "fs";
+import { stat } from "fs/promises";
+import { Readable } from "stream";
+import { and, eq } from "drizzle-orm";
+import { db } from "@/db";
+import { segments } from "@/db/schema";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+type RouteContext = {
+  params: Promise<{ id: string; segmentId: string }>;
+};
+
+export async function GET(_request: Request, context: RouteContext) {
+  const { id, segmentId } = await context.params;
+  const [segment] = await db
+    .select()
+    .from(segments)
+    .where(and(eq(segments.id, segmentId), eq(segments.jobId, id)))
+    .limit(1);
+
+  if (!segment?.filePath) {
+    return Response.json({ error: "Segment file not found." }, { status: 404 });
+  }
+
+  try {
+    const info = await stat(segment.filePath);
+    const stream = createReadStream(segment.filePath);
+    return new Response(Readable.toWeb(stream) as ReadableStream, {
+      headers: {
+        "Content-Type": "audio/mpeg",
+        "Content-Length": String(info.size),
+        "Content-Disposition": `attachment; filename="${segment.filename ?? "segment.mp3"}"`,
+      },
+    });
+  } catch {
+    return Response.json({ error: "Segment file is no longer on disk." }, { status: 404 });
+  }
+}
+
+
+================================================================================
+FILE PATH: src\app\api\status\route.ts
+================================================================================
+export const dynamic = "force-dynamic";
+
+export async function GET() {
+  return Response.json({
+    groqConfigured: Boolean(process.env.GROQ_API_KEY?.trim()),
+    maxUploadMb: 50,
+  });
+}
+
+
+================================================================================
+FILE PATH: src\app\globals.css
+================================================================================
+@import "tailwindcss";
+
+@theme {
+  --font-sans: var(--font-outfit), "Segoe UI", sans-serif;
+  --font-display: var(--font-fraunces), Georgia, serif;
+  --color-ink: #100d0a;
+  --color-ink-2: #181410;
+  --color-ink-3: #241c16;
+  --color-paper: #f3eadc;
+  --color-paper-dim: #cfc1ad;
+  --color-copper: #c57a45;
+  --color-copper-2: #e29a64;
+  --color-gold: #e3bf86;
+  --color-moss: #7f9168;
+  --color-rose: #c45d4c;
+  --color-line: rgba(243, 234, 220, 0.12);
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  background: #100d0a;
+  color: #f3eadc;
+}
+
+::selection {
+  background: #c57a45;
+  color: #100d0a;
+}
+
+textarea,
+input,
+button {
+  font: inherit;
+}
+
+.grain {
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  opacity: 0.09;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+.console-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.console-scroll::-webkit-scrollbar-thumb {
+  background: rgba(197, 122, 69, 0.4);
+  border-radius: 999px;
+}
+
+.lyric-sheet {
+  background-image:
+    linear-gradient(180deg, rgba(16, 13, 10, 0.28), rgba(16, 13, 10, 0.55)),
+    url("/images/lyrics-sheet.jpg");
+  background-size: cover;
+  background-position: center;
+}
+
+.hero-wash {
+  background-image:
+    linear-gradient(90deg, rgba(16, 13, 10, 0.82) 0%, rgba(16, 13, 10, 0.55) 42%, rgba(16, 13, 10, 0.22) 100%),
+    linear-gradient(180deg, rgba(16, 13, 10, 0.15), rgba(16, 13, 10, 0.88)),
+    url("/images/hero-mixer.jpg");
+  background-size: cover;
+  background-position: center 40%;
+}
+
+
+================================================================================
+FILE PATH: src\app\layout.tsx
+================================================================================
+import type { Metadata } from "next";
+import type { ReactNode } from "react";
+import { Fraunces, Outfit } from "next/font/google";
+import "./globals.css";
+
+const fraunces = Fraunces({
+  subsets: ["latin"],
+  variable: "--font-fraunces",
+  display: "swap",
+});
+
+const outfit = Outfit({
+  subsets: ["latin"],
+  variable: "--font-outfit",
+  display: "swap",
+});
+
+export const metadata: Metadata = {
+  title: "Cutline — Audio Lyrics Splitter",
+  description:
+    "Upload a song and a lyric sheet. Cutline timestamps the vocal, maps each line, and splits lyric clips plus instrumental breaths into a ZIP.",
+  icons: {
+    icon: "/images/cutline-mark.png",
+  },
+};
+
+export default function RootLayout({ children }: { children: ReactNode }) {
+  return (
+    <html lang="en">
+      <body className={`${fraunces.variable} ${outfit.variable} font-sans antialiased`}>{children}</body>
+    </html>
+  );
+}
+
+
+================================================================================
+FILE PATH: src\app\page.tsx
+================================================================================
+import { desc } from "drizzle-orm";
+import { StudioApp } from "@/components/studio-app";
+import { db } from "@/db";
+import { jobs } from "@/db/schema";
+import { serializeJob } from "@/lib/serialize";
+
+export const dynamic = "force-dynamic";
+
+export default async function HomePage() {
+  let initialJobs: ReturnType<typeof serializeJob>[] = [];
+
+  try {
+    const rows = await db.select().from(jobs).orderBy(desc(jobs.createdAt)).limit(24);
+    initialJobs = rows.map((row) => serializeJob(row));
+  } catch {
+    initialJobs = [];
+  }
+
+  return (
+    <StudioApp
+      initialJobs={initialJobs}
+      groqConfigured={Boolean(process.env.GROQ_API_KEY?.trim())}
+    />
+  );
+}
+
+
+================================================================================
+FILE PATH: src\components\studio-app.tsx
+================================================================================
+"use client";
+
+import Image from "next/image";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { downloadBrowserZip } from "@/lib/client-zip";
+import { formatBytes, formatClock, SAMPLE_LYRICS, STATUS_COPY } from "@/lib/format";
+import type { JobStatus, SerializedJob, SerializedSegment } from "@/lib/types";
+
+type StudioAppProps = {
+  initialJobs: SerializedJob[];
+  groqConfigured: boolean;
+};
+
+const ACCEPT = ".mp3,.wav,.ogg,.m4a,.flac,.webm,.mp4";
+const ACTIVE_STATUSES: JobStatus[] = ["uploaded", "transcribing", "aligning", "splitting"];
+
+export function StudioApp({ initialJobs, groqConfigured }: StudioAppProps) {
+  const [jobs, setJobs] = useState(initialJobs);
+  const [activeJob, setActiveJob] = useState<SerializedJob | null>(null);
+  const [lyrics, setLyrics] = useState("");
+  const [title, setTitle] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  const [peaks, setPeaks] = useState<number[]>([]);
+  const [localDuration, setLocalDuration] = useState(0);
+  const [dragOver, setDragOver] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [apiKey, setApiKey] = useState("");
+  const [showKey, setShowKey] = useState(false);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [playingId, setPlayingId] = useState<string | null>(null);
+  const [zipping, setZipping] = useState(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const objectUrlRef = useRef<string | null>(null);
+  const playRangeRef = useRef<{ end: number; id: string } | null>(null);
+
+  useEffect(() => {
+    const stored = window.localStorage.getItem("cutline-groq-key");
+    if (stored) setApiKey(stored);
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem("cutline-groq-key", apiKey);
+  }, [apiKey]);
+
+  useEffect(() => {
+    return () => {
+      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+    };
+  }, []);
+
+  const activeId = activeJob?.id;
+  const activeStatus = activeJob?.status;
+
+  useEffect(() => {
+    if (!activeId || !activeStatus || !ACTIVE_STATUSES.includes(activeStatus)) return;
+
+    const timer = window.setInterval(async () => {
+      const response = await fetch(`/api/jobs/${activeId}`, { cache: "no-store" });
+      if (!response.ok) return;
+      const payload = (await response.json()) as { job: SerializedJob };
+      setActiveJob(payload.job);
+      setJobs((current) => current.map((job) => (job.id === payload.job.id ? payload.job : job)));
+    }, 1400);
+
+    return () => window.clearInterval(timer);
+  }, [activeId, activeStatus]);
+
+  const audioSrc = useMemo(() => {
+    if (file && objectUrlRef.current) return objectUrlRef.current;
+    if (activeJob) return `/api/jobs/${activeJob.id}/audio`;
+    return "";
+  }, [file, activeJob]);
+
+  const segments = activeJob?.segments ?? [];
+  const duration = activeJob?.durationSeconds || localDuration;
+  const processing = Boolean(activeJob && ACTIVE_STATUSES.includes(activeJob.status));
+
+  const onFile = useCallback(async (next: File | null) => {
+    setFile(next);
+    setError(null);
+    if (objectUrlRef.current) {
+      URL.revokeObjectURL(objectUrlRef.current);
+      objectUrlRef.current = null;
+    }
+    if (!next) {
+      setPeaks([]);
+      setLocalDuration(0);
+      return;
+    }
+    objectUrlRef.current = URL.createObjectURL(next);
+    setTitle(next.name.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " "));
+    try {
+      const measured = await computePeaks(next);
+      setPeaks(measured.peaks);
+      setLocalDuration(measured.duration);
+    } catch {
+      setPeaks([]);
+    }
+  }, []);
+
+  async function handleSubmit(event: FormEvent) {
+    event.preventDefault();
+    if (!file) {
+      setError("Drop a song onto the desk first.");
+      return;
+    }
+    if (!lyrics.trim()) {
+      setError("The lyric sheet is empty.");
+      return;
+    }
+
+    setBusy(true);
+    setError(null);
+
+    const body = new FormData();
+    body.append("audio", file);
+    body.append("lyrics", lyrics);
+    if (title.trim()) body.append("title", title.trim());
+
+    try {
+      const response = await fetch("/api/jobs", {
+        method: "POST",
+        body,
+        headers: apiKey.trim() ? { "x-groq-api-key": apiKey.trim() } : undefined,
+      });
+      const payload = (await response.json()) as { job?: SerializedJob; error?: string };
+      if (!response.ok || !payload.job) {
+        throw new Error(payload.error || "The booth could not take the reel.");
+      }
+      setActiveJob(payload.job);
+      setJobs((current) => [payload.job!, ...current.filter((job) => job.id !== payload.job!.id)]);
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Upload failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function loadJob(id: string) {
+    const response = await fetch(`/api/jobs/${id}`, { cache: "no-store" });
+    if (!response.ok) return;
+    const payload = (await response.json()) as { job: SerializedJob };
+    setActiveJob(payload.job);
+    setLyrics(payload.job.lyrics);
+    setTitle(payload.job.title);
+    setLibraryOpen(false);
+  }
+
+  async function retryJob() {
+    if (!activeJob) return;
+    const response = await fetch(`/api/jobs/${activeJob.id}/process`, {
+      method: "POST",
+      headers: apiKey.trim() ? { "x-groq-api-key": apiKey.trim() } : undefined,
+    });
+    const payload = (await response.json()) as { job?: SerializedJob; error?: string };
+    if (!response.ok || !payload.job) {
+      setError(payload.error || "Could not restart the cut.");
+      return;
+    }
+    setActiveJob({ ...payload.job, status: "uploaded" });
+  }
+
+  async function deleteJob(id: string) {
+    await fetch(`/api/jobs/${id}`, { method: "DELETE" });
+    setJobs((current) => current.filter((job) => job.id !== id));
+    if (activeJob?.id === id) {
+      setActiveJob(null);
+    }
+  }
+
+  function playSegment(segment: SerializedSegment) {
+    const audio = audioRef.current;
+    if (!audio) return;
+    playRangeRef.current = { end: segment.endTime, id: segment.id };
+    audio.currentTime = Math.max(0, segment.startTime);
+    void audio.play();
+    setPlayingId(segment.id);
+  }
+
+  function toggleMaster() {
+    const audio = audioRef.current;
+    if (!audio) return;
+    playRangeRef.current = null;
+    if (audio.paused) {
+      void audio.play();
+      setPlayingId("master");
+    } else {
+      audio.pause();
+      setPlayingId(null);
+    }
+  }
+
+  async function handleBrowserZip() {
+    if (!activeJob || segments.length === 0) return;
+    setZipping(true);
+    setError(null);
+    try {
+      if (file) {
+        await downloadBrowserZip(file, segments, activeJob.title);
+      } else {
+        const response = await fetch(`/api/jobs/${activeJob.id}/audio`);
+        if (!response.ok) throw new Error("Could not load the original reel.");
+        const buffer = await response.arrayBuffer();
+        await downloadBrowserZip(buffer, segments, activeJob.title);
+      }
+    } catch (zipError) {
+      setError(zipError instanceof Error ? zipError.message : "Browser zip failed.");
+    } finally {
+      setZipping(false);
+    }
+  }
+
+  return (
+    <div className="relative min-h-screen overflow-x-hidden bg-ink text-paper">
+      <div className="grain" />
+      <header className="relative z-20 flex items-center justify-between gap-4 border-b border-line px-5 py-4 md:px-8">
+        <div className="flex items-center gap-3">
+          <Image
+            src="/images/cutline-mark.png"
+            alt="Cutline mark"
+            width={44}
+            height={44}
+            className="size-11 rounded-full border border-copper/40 object-cover"
+          />
+          <div>
+            <p className="font-display text-xl tracking-[0.22em] text-gold">CUTLINE</p>
+            <p className="text-[11px] uppercase tracking-[0.22em] text-paper-dim">Analog lyric lathe</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setHelpOpen(true)}
+            className="rounded-full border border-line px-4 py-2 text-[11px] uppercase tracking-[0.18em] text-paper-dim transition hover:border-copper hover:text-gold"
+          >
+            Method
+          </button>
+          <button
+            type="button"
+            onClick={() => setLibraryOpen(true)}
+            className="rounded-full bg-copper px-4 py-2 text-[11px] uppercase tracking-[0.18em] text-ink transition hover:bg-copper-2"
+          >
+            Vault {jobs.length > 0 ? `· ${jobs.length}` : ""}
+          </button>
+        </div>
+      </header>
+
+      <section className="hero-wash relative mx-5 mt-5 overflow-hidden rounded-[28px] border border-line md:mx-8">
+        <div className="grid gap-8 px-6 py-10 md:grid-cols-[1.2fr_0.8fr] md:px-10 md:py-14">
+          <div>
+            <p className="text-xs uppercase tracking-[0.28em] text-gold">Studio floor</p>
+            <h1 className="mt-3 max-w-xl font-display text-4xl leading-[0.95] text-paper md:text-6xl">
+              Split a song into verses and the silence between them.
+            </h1>
+            <p className="mt-5 max-w-lg text-sm leading-6 text-paper-dim md:text-base">
+              Drop an MP3 and the lyric sheet. Whisper timestamps the vocal, an LLM lines each line
+              to the tape, then Cutline slices lyric clips and instrumental breaths into a ZIP.
+            </p>
+          </div>
+          <div className="flex flex-col justify-end gap-4">
+            <div className="rounded-3xl border border-line bg-ink/55 p-5 backdrop-blur-sm">
+              <div className="flex items-center justify-between text-[11px] uppercase tracking-[0.18em] text-paper-dim">
+                <span>Booth key</span>
+                <span className={groqConfigured || apiKey ? "text-moss" : "text-rose"}>
+                  {groqConfigured ? "Env live" : apiKey ? "Session key" : "Needed"}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowKey((value) => !value)}
+                className="mt-3 text-left text-sm text-gold underline-offset-4 hover:underline"
+              >
+                {showKey ? "Hide Groq key field" : "Add or override Groq API key"}
+              </button>
+              {showKey ? (
+                <input
+                  type="password"
+                  value={apiKey}
+                  onChange={(event) => setApiKey(event.target.value)}
+                  placeholder="gsk_..."
+                  className="mt-3 w-full rounded-2xl border border-line bg-ink-2 px-4 py-3 text-sm text-paper outline-none ring-copper/40 focus:ring-2"
+                />
+              ) : null}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <main className="relative z-10 mx-auto grid max-w-[1400px] gap-6 px-5 py-6 md:px-8 lg:grid-cols-[1.05fr_0.95fr]">
+        <form
+          onSubmit={handleSubmit}
+          className="rounded-[28px] border border-line bg-ink-2/90 p-5 shadow-[0_30px_80px_rgba(0,0,0,0.35)] md:p-7"
+        >
+          <div className="flex items-end justify-between gap-4">
+            <div>
+              <p className="text-[11px] uppercase tracking-[0.22em] text-copper-2">01 · Source</p>
+              <h2 className="mt-1 font-display text-3xl">The reel</h2>
+            </div>
+            <input
+              value={title}
+              onChange={(event) => setTitle(event.target.value)}
+              placeholder="Working title"
+              className="w-40 rounded-full border border-line bg-transparent px-4 py-2 text-xs uppercase tracking-[0.16em] outline-none focus:border-copper"
+            />
+          </div>
+
+          <label
+            onDragOver={(event) => {
+              event.preventDefault();
+              setDragOver(true);
+            }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={(event) => {
+              event.preventDefault();
+              setDragOver(false);
+              const next = event.dataTransfer.files[0];
+              if (next) void onFile(next);
+            }}
+            className={`mt-6 block cursor-pointer rounded-[24px] border border-dashed p-5 transition ${
+              dragOver ? "border-copper bg-copper/10" : "border-line bg-ink"
+            }`}
+          >
+            <input
+              type="file"
+              accept={ACCEPT}
+              className="hidden"
+              onChange={(event) => void onFile(event.target.files?.[0] ?? null)}
+            />
+            <div className="flex flex-col gap-4 md:flex-row md:items-center">
+              <Image
+                src="/images/vinyl.jpg"
+                alt="Vinyl close-up"
+                width={120}
+                height={80}
+                className="h-20 w-28 rounded-2xl object-cover"
+              />
+              <div className="flex-1">
+                <p className="font-display text-2xl">
+                  {file ? file.name : "Drop the master take"}
+                </p>
+                <p className="mt-1 text-sm text-paper-dim">
+                  {file
+                    ? `${formatBytes(file.size)} · ${formatClock(localDuration)}`
+                    : "MP3, WAV, OGG, M4A · up to 50MB"}
+                </p>
+              </div>
+            </div>
+            <Waveform
+              peaks={peaks}
+              duration={duration}
+              currentTime={currentTime}
+              segments={segments}
+              onSeek={(time) => {
+                if (audioRef.current) audioRef.current.currentTime = time;
+              }}
+            />
+          </label>
+
+          <div className="mt-6">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-[11px] uppercase tracking-[0.22em] text-copper-2">02 · Sheet</p>
+                <h2 className="mt-1 font-display text-3xl">Lyrics</h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => setLyrics(SAMPLE_LYRICS)}
+                className="text-[11px] uppercase tracking-[0.16em] text-gold hover:underline"
+              >
+                Load sample
+              </button>
+            </div>
+            <div className="lyric-sheet mt-4 overflow-hidden rounded-[24px] border border-line">
+              <textarea
+                value={lyrics}
+                onChange={(event) => setLyrics(event.target.value)}
+                rows={12}
+                placeholder="Paste the full lyric sheet. Tags like [Intro] and [Chorus] are stripped automatically."
+                className="min-h-[280px] w-full resize-y bg-ink/70 px-5 py-5 font-display text-lg leading-8 text-paper outline-none placeholder:text-paper-dim/70"
+              />
+            </div>
+          </div>
+
+          {error ? (
+            <p className="mt-4 rounded-2xl border border-rose/40 bg-rose/10 px-4 py-3 text-sm text-paper">
+              {error}
+            </p>
+          ) : null}
+
+          <button
+            type="submit"
+            disabled={busy || processing}
+            className="mt-6 w-full rounded-full bg-copper py-4 text-sm uppercase tracking-[0.24em] text-ink transition hover:bg-copper-2 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {busy ? "Handing the reel over…" : processing ? "The lathe is already spinning" : "Cut the record"}
+          </button>
+        </form>
+
+        <section className="rounded-[28px] border border-line bg-ink-2/90 p-5 md:p-7">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <p className="text-[11px] uppercase tracking-[0.22em] text-copper-2">03 · Cut</p>
+              <h2 className="mt-1 font-display text-3xl">{activeJob?.title ?? "Waiting for a take"}</h2>
+              <p className="mt-2 max-w-md text-sm text-paper-dim">
+                {activeJob
+                  ? STATUS_COPY[activeJob.status].detail
+                  : "Upload a track and the lyric sheet. The timeline will appear here."}
+              </p>
+            </div>
+            {activeJob ? (
+              <span className="rounded-full border border-gold/30 px-3 py-1 text-[11px] uppercase tracking-[0.16em] text-gold">
+                {STATUS_COPY[activeJob.status].label}
+              </span>
+            ) : null}
+          </div>
+
+          <ProcessRail status={activeJob?.status ?? null} />
+
+          {audioSrc ? (
+            <div className="mt-6 rounded-[22px] border border-line bg-ink p-4">
+              <div className="flex items-center justify-between gap-3">
+                <button
+                  type="button"
+                  onClick={toggleMaster}
+                  className="rounded-full border border-copper px-4 py-2 text-[11px] uppercase tracking-[0.16em] text-gold"
+                >
+                  {playingId === "master" ? "Pause master" : "Play master"}
+                </button>
+                <p className="text-xs text-paper-dim">{formatClock(currentTime)} / {formatClock(duration)}</p>
+              </div>
+              <audio
+                ref={audioRef}
+                src={audioSrc}
+                className="mt-3 w-full"
+                controls
+                onTimeUpdate={(event) => {
+                  const time = event.currentTarget.currentTime;
+                  setCurrentTime(time);
+                  const range = playRangeRef.current;
+                  if (range && time >= range.end) {
+                    event.currentTarget.pause();
+                    playRangeRef.current = null;
+                    setPlayingId(null);
+                  }
+                }}
+                onPause={() => {
+                  if (!playRangeRef.current) setPlayingId(null);
+                }}
+              />
+            </div>
+          ) : null}
+
+          {activeJob?.error ? (
+            <div className="mt-5 rounded-2xl border border-rose/40 bg-rose/10 p-4">
+              <p className="text-sm">{activeJob.error}</p>
+              {activeJob.status === "failed" ? (
+                <button
+                  type="button"
+                  onClick={() => void retryJob()}
+                  className="mt-3 text-[11px] uppercase tracking-[0.16em] text-gold underline"
+                >
+                  Run the cut again
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+
+          {activeJob && segments.length > 0 ? (
+            <div className="mt-5 flex flex-wrap gap-3">
+              <a
+                href={`/api/jobs/${activeJob.id}/download`}
+                className="rounded-full bg-gold px-5 py-3 text-[11px] uppercase tracking-[0.18em] text-ink"
+              >
+                Download ZIP · {segments.length} clips
+              </a>
+              <button
+                type="button"
+                onClick={() => void handleBrowserZip()}
+                disabled={zipping}
+                className="rounded-full border border-line px-5 py-3 text-[11px] uppercase tracking-[0.18em] text-paper-dim"
+              >
+                {zipping ? "Building WAV pack…" : "Browser WAV pack"}
+              </button>
+            </div>
+          ) : null}
+
+          <div className="console-scroll mt-6 max-h-[520px] space-y-3 overflow-auto pr-1">
+            {segments.length === 0 ? (
+              <EmptyVault />
+            ) : (
+              segments.map((segment) => (
+                <article
+                  key={segment.id}
+                  className="grid grid-cols-[auto_1fr_auto] items-center gap-4 rounded-2xl border border-line bg-ink px-4 py-3"
+                >
+                  <span
+                    className={`rounded-full px-2.5 py-1 text-[10px] uppercase tracking-[0.16em] ${
+                      segment.type === "lyric"
+                        ? "bg-copper/20 text-copper-2"
+                        : "bg-moss/20 text-moss"
+                    }`}
+                  >
+                    {segment.type}
+                  </span>
+                  <div>
+                    <p className="font-display text-lg leading-tight">{segment.text}</p>
+                    <p className="mt-1 text-xs text-paper-dim">
+                      {formatClock(segment.startTime)} – {formatClock(segment.endTime)} ·{" "}
+                      {formatClock(segment.duration ?? segment.endTime - segment.startTime)}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => playSegment(segment)}
+                      className="rounded-full border border-line px-3 py-1 text-[10px] uppercase tracking-[0.16em] text-gold"
+                    >
+                      {playingId === segment.id ? "Playing" : "Cue"}
+                    </button>
+                    {segment.filename ? (
+                      <a
+                        href={`/api/jobs/${segment.jobId}/segments/${segment.id}`}
+                        className="rounded-full border border-line px-3 py-1 text-[10px] uppercase tracking-[0.16em] text-paper-dim"
+                      >
+                        File
+                      </a>
+                    ) : null}
+                  </div>
+                </article>
+              ))
+            )}
+          </div>
+        </section>
+      </main>
+
+      {libraryOpen ? (
+        <aside className="fixed inset-0 z-30 bg-ink/70 backdrop-blur-sm">
+          <div className="absolute right-0 top-0 flex h-full w-full max-w-md flex-col border-l border-line bg-ink-2">
+            <div className="flex items-center justify-between border-b border-line px-6 py-5">
+              <div>
+                <p className="text-[11px] uppercase tracking-[0.2em] text-copper-2">Vault</p>
+                <h3 className="font-display text-3xl">Previous cuts</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setLibraryOpen(false)}
+                className="text-sm text-paper-dim"
+              >
+                Close
+              </button>
+            </div>
+            <div className="console-scroll flex-1 space-y-3 overflow-auto p-5">
+              {jobs.length === 0 ? (
+                <p className="text-sm text-paper-dim">The vault is empty. Cut a record to fill it.</p>
+              ) : (
+                jobs.map((job) => (
+                  <article key={job.id} className="rounded-2xl border border-line bg-ink p-4">
+                    <button type="button" onClick={() => void loadJob(job.id)} className="w-full text-left">
+                      <p className="font-display text-xl">{job.title}</p>
+                      <p className="mt-1 text-xs uppercase tracking-[0.16em] text-paper-dim">
+                        {STATUS_COPY[job.status].label} · {job.segmentsCount} clips
+                      </p>
+                    </button>
+                    <div className="mt-3 flex gap-3 text-[11px] uppercase tracking-[0.16em]">
+                      <button type="button" onClick={() => void loadJob(job.id)} className="text-gold">
+                        Open
+                      </button>
+                      <button type="button" onClick={() => void deleteJob(job.id)} className="text-rose">
+                        Discard
+                      </button>
+                    </div>
+                  </article>
+                ))
+              )}
+            </div>
+          </div>
+        </aside>
+      ) : null}
+
+      {helpOpen ? (
+        <div className="fixed inset-0 z-30 grid place-items-center bg-ink/75 p-4 backdrop-blur-sm">
+          <div className="max-h-[90vh] w-full max-w-3xl overflow-auto rounded-[28px] border border-line bg-ink-2">
+            <div className="grid gap-0 md:grid-cols-[0.8fr_1.2fr]">
+              <Image
+                src="/images/vintage-desk.jpg"
+                alt="Vintage studio desk"
+                width={480}
+                height={640}
+                className="h-56 w-full object-cover md:h-full"
+              />
+              <div className="p-6 md:p-8">
+                <p className="text-[11px] uppercase tracking-[0.2em] text-copper-2">Method</p>
+                <h3 className="mt-2 font-display text-4xl">How the lathe works</h3>
+                <ol className="mt-6 space-y-4 text-sm leading-6 text-paper-dim">
+                  <li>
+                    <span className="text-gold">01.</span> Groq Whisper transcribes the audio with
+                    word and segment timestamps.
+                  </li>
+                  <li>
+                    <span className="text-gold">02.</span> Llama cleans the lyric sheet and maps each
+                    line onto those timestamps, marking gaps as instrumental.
+                  </li>
+                  <li>
+                    <span className="text-gold">03.</span> ffmpeg slices the master into MP3 clips and
+                    packs them into a ZIP.
+                  </li>
+                  <li>
+                    <span className="text-gold">04.</span> If the server pack is delayed, build a WAV
+                    pack in the browser from the same timeline.
+                  </li>
+                </ol>
+                <button
+                  type="button"
+                  onClick={() => setHelpOpen(false)}
+                  className="mt-8 rounded-full bg-copper px-5 py-3 text-[11px] uppercase tracking-[0.18em] text-ink"
+                >
+                  Back to the floor
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ProcessRail({ status }: { status: JobStatus | null }) {
+  const steps: JobStatus[] = ["uploaded", "transcribing", "aligning", "splitting", "completed"];
+  const current = status === "failed" ? -1 : status ? steps.indexOf(status) : -1;
+
+  return (
+    <div className="mt-6 grid grid-cols-5 gap-2">
+      {steps.map((step, index) => {
+        const on = current >= index;
+        return (
+          <div key={step} className={`rounded-full py-2 text-center text-[10px] uppercase tracking-[0.14em] ${
+            on ? "bg-copper text-ink" : "bg-ink text-paper-dim"
+          }`}>
+            {step === "uploaded" ? "Queue" : step === "transcribing" ? "Listen" : step === "aligning" ? "Align" : step === "splitting" ? "Cut" : "Vault"}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function Waveform({
+  peaks,
+  duration,
+  currentTime,
+  segments,
+  onSeek,
+}: {
+  peaks: number[];
+  duration: number;
+  currentTime: number;
+  segments: SerializedSegment[];
+  onSeek: (time: number) => void;
+}) {
+  const bars = peaks.length > 0 ? peaks : Array.from({ length: 64 }, () => 0.12);
+  const max = Math.max(...bars, 0.08);
+
+  return (
+    <div
+      className="mt-5 flex h-24 items-end gap-[3px]"
+      onClick={(event) => {
+        if (!duration) return;
+        const bounds = event.currentTarget.getBoundingClientRect();
+        const ratio = (event.clientX - bounds.left) / bounds.width;
+        onSeek(ratio * duration);
+      }}
+    >
+      {bars.map((value, index) => {
+        const ratio = index / bars.length;
+        const time = ratio * duration;
+        const segment = segments.find((item) => time >= item.startTime && time < item.endTime);
+        const active = duration > 0 && time <= currentTime;
+        const color = segment?.type === "lyric" ? "bg-copper-2" : segment?.type === "music" ? "bg-moss" : "bg-paper-dim";
+        return (
+          <span
+            key={index}
+            className={`flex-1 rounded-full ${color} ${active ? "opacity-100" : "opacity-35"}`}
+            style={{ height: `${Math.max(8, (value / max) * 100)}%` }}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+function EmptyVault() {
+  return (
+    <div className="rounded-[24px] border border-dashed border-line p-8 text-center">
+      <Image
+        src="/images/og-cutline.jpg"
+        alt="Studio atmosphere"
+        width={640}
+        height={360}
+        className="mx-auto h-40 w-full max-w-md rounded-2xl object-cover"
+      />
+      <p className="mt-5 font-display text-2xl">No clips on the bench yet</p>
+      <p className="mt-2 text-sm text-paper-dim">
+        After the lathe finishes, lyric lines and instrumental breaths will stack here.
+      </p>
+    </div>
+  );
+}
+
+async function computePeaks(file: File) {
+  const context = new AudioContext();
+  try {
+    const audio = await context.decodeAudioData((await file.arrayBuffer()).slice(0));
+    const data = audio.getChannelData(0);
+    const count = 88;
+    const block = Math.max(1, Math.floor(data.length / count));
+    const peaks: number[] = [];
+    for (let i = 0; i < count; i += 1) {
+      let sum = 0;
+      for (let j = 0; j < block; j += 1) {
+        sum += Math.abs(data[i * block + j] ?? 0);
+      }
+      peaks.push(sum / block);
+    }
+    return { peaks, duration: audio.duration };
+  } finally {
+    await context.close();
+  }
+}
+
+
+================================================================================
+FILE PATH: src\db\index.ts
+================================================================================
+import { drizzle } from "drizzle-orm/node-postgres";
+import { Pool } from "pg";
+import * as schema from "./schema";
+
+const databaseUrl = process.env.DATABASE_URL;
+
+if (!databaseUrl) {
+  throw new Error("DATABASE_URL is required");
+}
+
+const globalForDb = globalThis as typeof globalThis & {
+  __arenaNextJsPostgresqlPool?: Pool;
+};
+
+export const pool =
+  globalForDb.__arenaNextJsPostgresqlPool ??
+  new Pool({
+    connectionString: databaseUrl,
+  });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForDb.__arenaNextJsPostgresqlPool = pool;
+}
+
+export const db = drizzle(pool, { schema });
+
+
+================================================================================
+FILE PATH: src\db\schema.ts
+================================================================================
+import {
+  integer,
+  jsonb,
+  pgTable,
+  real,
+  text,
+  timestamp,
+  uuid,
+} from "drizzle-orm/pg-core";
+
+export const jobs = pgTable("jobs", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  title: text("title").notNull(),
+  originalFilename: text("original_filename").notNull(),
+  mimeType: text("mime_type").notNull(),
+  filePath: text("file_path").notNull(),
+  lyrics: text("lyrics").notNull(),
+  cleanedLyrics: text("cleaned_lyrics"),
+  transcription: text("transcription"),
+  transcriptionJson: jsonb("transcription_json").$type<Record<string, unknown> | null>(),
+  status: text("status").notNull().default("uploaded"),
+  error: text("error"),
+  zipPath: text("zip_path"),
+  durationSeconds: real("duration_seconds"),
+  segmentsCount: integer("segments_count").notNull().default(0),
+  alignmentSource: text("alignment_source"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const segments = pgTable("segments", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  jobId: uuid("job_id")
+    .references(() => jobs.id, { onDelete: "cascade" })
+    .notNull(),
+  index: integer("index").notNull(),
+  startTime: real("start_time").notNull(),
+  endTime: real("end_time").notNull(),
+  type: text("type").notNull(),
+  text: text("text").notNull(),
+  filename: text("filename"),
+  filePath: text("file_path"),
+  duration: real("duration"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export type JobRow = typeof jobs.$inferSelect;
+export type NewJobRow = typeof jobs.$inferInsert;
+export type SegmentRow = typeof segments.$inferSelect;
+
+
+================================================================================
+FILE PATH: src\lib\audio.ts
+================================================================================
+import { execFile } from "child_process";
+import { readdir, readFile, writeFile } from "fs/promises";
+import path from "path";
+import { promisify } from "util";
+import ffmpegPath from "ffmpeg-static";
+import JSZip from "jszip";
+import { parseBuffer } from "music-metadata";
+import { jobDir, sanitizeFilename, segmentsDir } from "@/lib/paths";
+import type { AlignedSegment } from "@/lib/types";
+
+const execFileAsync = promisify(execFile);
+
+export type SplitFile = {
+  index: number;
+  filename: string;
+  filepath: string;
+  type: AlignedSegment["type"];
+  text: string;
+  duration: number;
+  startTime: number;
+  endTime: number;
+};
+
+export async function readAudioDuration(filePath: string) {
+  const buffer = await readFile(filePath);
+  const metadata = await parseBuffer(buffer, undefined, { duration: true });
+  return metadata.format.duration ?? 0;
+}
+
+export async function splitAudio(jobId: string, audioPath: string, aligned: AlignedSegment[]) {
+  if (!ffmpegPath) {
+    throw new Error("ffmpeg binary is not available");
+  }
+
+  const outputDir = segmentsDir(jobId);
+  const files: SplitFile[] = [];
+
+  for (const segment of aligned) {
+    const duration = Math.max(0.05, segment.end_time - segment.start_time);
+    const safeText = sanitizeFilename(segment.text);
+    const filename = `${String(segment.id).padStart(3, "0")}_${segment.type}_${safeText}.mp3`;
+    const filepath = path.join(outputDir, filename);
+
+    await execFileAsync(
+      ffmpegPath,
+      [
+        "-y",
+        "-ss",
+        segment.start_time.toFixed(3),
+        "-t",
+        duration.toFixed(3),
+        "-i",
+        audioPath,
+        "-acodec",
+        "libmp3lame",
+        "-ab",
+        "192k",
+        filepath,
+      ],
+      { timeout: 120000 },
+    );
+
+    files.push({
+      index: segment.id,
+      filename,
+      filepath,
+      type: segment.type,
+      text: segment.text,
+      duration,
+      startTime: segment.start_time,
+      endTime: segment.end_time,
+    });
+  }
+
+  return files;
+}
+
+export async function createZipFromFiles(jobId: string, files: SplitFile[], zipName = "segments.zip") {
+  const zip = new JSZip();
+  for (const file of files) {
+    zip.file(file.filename, await readFile(file.filepath));
+  }
+  const buffer = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+  const zipPath = path.join(jobDir(jobId), zipName);
+  await writeFile(zipPath, buffer);
+  return zipPath;
+}
+
+export async function collectExistingSplits(jobId: string): Promise<SplitFile[]> {
+  const outputDir = segmentsDir(jobId);
+  try {
+    const names = await readdir(outputDir);
+    return names
+      .filter((name) => name.endsWith(".mp3"))
+      .sort()
+      .map((filename, index) => ({
+        index: index + 1,
+        filename,
+        filepath: path.join(outputDir, filename),
+        type: filename.includes("_music_") ? "music" : "lyric",
+        text: filename,
+        duration: 0,
+        startTime: 0,
+        endTime: 0,
+      }));
+  } catch {
+    return [];
+  }
+}
+
+
+================================================================================
+FILE PATH: src\lib\client-zip.ts
+================================================================================
+import JSZip from "jszip";
+import { sanitizeFilename } from "@/lib/filenames";
+import type { SerializedSegment } from "@/lib/types";
+
+export async function downloadBrowserZip(
+  source: File | ArrayBuffer,
+  segments: SerializedSegment[],
+  title: string,
+) {
+  const context = new AudioContext();
+  try {
+    const bytes = source instanceof File ? await source.arrayBuffer() : source;
+    const audio = await context.decodeAudioData(bytes.slice(0));
+    const zip = new JSZip();
+
+    for (const segment of segments) {
+      const wav = encodeWavSlice(audio, segment.startTime, segment.endTime);
+      const filename = `${String(segment.index).padStart(3, "0")}_${segment.type}_${sanitizeFilename(segment.text)}.wav`;
+      zip.file(filename, wav);
+    }
+
+    const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${title.replace(/[^\w.-]+/g, "_") || "cutline"}_segments.zip`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  } finally {
+    await context.close();
+  }
+}
+
+function encodeWavSlice(buffer: AudioBuffer, start: number, end: number) {
+  const sampleRate = buffer.sampleRate;
+  const startSample = Math.max(0, Math.floor(start * sampleRate));
+  const endSample = Math.min(buffer.length, Math.floor(end * sampleRate));
+  const frameCount = Math.max(1, endSample - startSample);
+  const channels = buffer.numberOfChannels;
+  const bytesPerSample = 2;
+  const blockAlign = channels * bytesPerSample;
+  const dataSize = frameCount * blockAlign;
+  const output = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(output);
+
+  writeString(view, 0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(view, 8, "WAVE");
+  writeString(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * blockAlign, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, 16, true);
+  writeString(view, 36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (let i = 0; i < frameCount; i += 1) {
+    for (let channel = 0; channel < channels; channel += 1) {
+      const sample = buffer.getChannelData(channel)[startSample + i] ?? 0;
+      const clipped = Math.max(-1, Math.min(1, sample));
+      view.setInt16(offset, clipped < 0 ? clipped * 0x8000 : clipped * 0x7fff, true);
+      offset += 2;
+    }
+  }
+
+  return output;
+}
+
+function writeString(view: DataView, offset: number, value: string) {
+  for (let i = 0; i < value.length; i += 1) {
+    view.setUint8(offset + i, value.charCodeAt(i));
+  }
+}
+
+
+================================================================================
+FILE PATH: src\lib\filenames.ts
+================================================================================
+export function extensionOf(filename: string) {
+  const ext = filename.split(".").pop()?.toLowerCase() ?? "mp3";
+  return ext.replace(/[^a-z0-9]/g, "") || "mp3";
+}
+
+export function sanitizeFilename(text: string) {
+  const cleaned = text
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "")
+    .replace(/\s+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^\.+/, "")
+    .slice(0, 36);
+  return cleaned || "clip";
+}
+
+export function titleFromFilename(filename: string) {
+  const base = filename.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ").trim();
+  return base || "Untitled cut";
+}
+
+
+================================================================================
+FILE PATH: src\lib\format.ts
+================================================================================
+import type { JobStatus } from "@/lib/types";
+
+export function formatClock(seconds: number | null | undefined) {
+  const value = Math.max(0, Number(seconds) || 0);
+  const minutes = Math.floor(value / 60);
+  const rest = value - minutes * 60;
+  return `${minutes}:${rest.toFixed(1).padStart(4, "0")}`;
+}
+
+export function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export const STATUS_COPY: Record<JobStatus, { label: string; detail: string }> = {
+  uploaded: {
+    label: "At the desk",
+    detail: "The reel is queued. Whisper is about to listen.",
+  },
+  transcribing: {
+    label: "Listening",
+    detail: "Whisper is stamping every word with a timestamp.",
+  },
+  aligning: {
+    label: "Scoring the sheet",
+    detail: "The lyric map is being lined up to the vocal take.",
+  },
+  splitting: {
+    label: "Cutting tape",
+    detail: "Lyric lines and instrumental breaths are being sliced.",
+  },
+  completed: {
+    label: "In the vault",
+    detail: "Every clip is boxed and ready to download.",
+  },
+  failed: {
+    label: "Take didn't land",
+    detail: "Something snagged in the booth. You can run it again.",
+  },
+};
+
+export const SAMPLE_LYRICS = `[Intro]
+Hello world
+This is a test
+
+[Verse]
+Line one here
+Line two here
+
+[Chorus]
+We split the night into verses
+And leave the quiet for the music`;
+
+
+================================================================================
+FILE PATH: src\lib\groq.ts
+================================================================================
+import { readFile } from "fs/promises";
+import Groq, { toFile } from "groq-sdk";
+import { alignLyricsHeuristic, cleanLyrics, formatTranscriptionForLlm, normalizeSegments } from "@/lib/lyrics";
+import type { AlignedSegment, WhisperResult, WhisperSegment, WhisperWord } from "@/lib/types";
+
+const CHAT_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"];
+
+type VerboseTranscription = {
+  text?: string;
+  duration?: number;
+  words?: Array<{ word?: string; start?: number; end?: number }>;
+  segments?: Array<{ id?: number; start?: number; end?: number; text?: string }>;
+};
+
+export function resolveGroqApiKey(request?: Request) {
+  const headerKey = request?.headers.get("x-groq-api-key")?.trim();
+  return headerKey || process.env.GROQ_API_KEY?.trim() || "";
+}
+
+export function createGroqClient(apiKey: string) {
+  return new Groq({ apiKey });
+}
+
+export async function transcribeAudio(apiKey: string, filePath: string, filename: string): Promise<WhisperResult> {
+  const client = createGroqClient(apiKey);
+  const buffer = await readFile(filePath);
+  const file = await toFile(buffer, filename);
+  const result = (await client.audio.transcriptions.create({
+    file,
+    model: "whisper-large-v3",
+    response_format: "verbose_json",
+    timestamp_granularities: ["word", "segment"],
+    temperature: 0,
+  })) as VerboseTranscription;
+
+  const words: WhisperWord[] = (result.words ?? [])
+    .map((word) => ({
+      word: (word.word ?? "").trim(),
+      start: Number(word.start ?? 0),
+      end: Number(word.end ?? 0),
+    }))
+    .filter((word) => word.word.length > 0 && Number.isFinite(word.start) && Number.isFinite(word.end));
+
+  const segments: WhisperSegment[] = (result.segments ?? [])
+    .map((segment) => ({
+      id: segment.id,
+      start: Number(segment.start ?? 0),
+      end: Number(segment.end ?? 0),
+      text: (segment.text ?? "").trim(),
+    }))
+    .filter((segment) => segment.text.length > 0);
+
+  return {
+    text: (result.text ?? "").trim(),
+    words,
+    segments,
+    duration: typeof result.duration === "number" ? result.duration : undefined,
+  };
+}
+
+export async function alignLyricsWithAudio(
+  apiKey: string,
+  lyrics: string,
+  transcription: WhisperResult,
+  duration: number,
+) {
+  const formatted = formatTranscriptionForLlm(transcription.segments, transcription.words);
+  const cleanedLines = cleanLyrics(lyrics);
+
+  try {
+    const llmSegments = await alignWithLlm(apiKey, lyrics, formatted);
+    return {
+      source: "llm" as const,
+      cleanedLyrics: cleanedLines.join("\n"),
+      segments: normalizeSegments(llmSegments, duration),
+    };
+  } catch {
+    return {
+      source: "heuristic" as const,
+      cleanedLyrics: cleanedLines.join("\n"),
+      segments: alignLyricsHeuristic(lyrics, transcription.words, transcription.segments, duration),
+    };
+  }
+}
+
+async function alignWithLlm(apiKey: string, lyrics: string, whisperTranscription: string) {
+  if (!whisperTranscription) {
+    throw new Error("Empty transcription");
+  }
+
+  const client = createGroqClient(apiKey);
+  const prompt = `You are an audio-lyrics alignment assistant. Analyze transcribed audio with timestamps and user-provided lyrics, then create precise audio segments.
+
+## TASK
+1. Remove metadata from lyrics such as [Intro], [Outro], [Verse 1], [Chorus], (x2) in ANY language.
+2. Match each cleaned lyric line to the corresponding timestamp in the transcription.
+3. Identify instrumental/music-only segments between lyric lines.
+4. Create a segmentation map.
+
+## RULES
+- Strip ALL structural markers like [Intro], [Verse], [Chorus], (x2), etc. in any language
+- Match lyrics SEMANTICALLY, not just exact word matching
+- Ensure segments do not overlap
+- Mark gaps between lyrics greater than 1 second as "music" segments
+- Start and end times should be precise to 1 decimal place
+- Segments must be in chronological order
+- If there is an intro before the first lyric, mark it as music
+- If there is an outro after the last lyric, mark it as music
+
+## OUTPUT FORMAT (JSON ONLY)
+{
+  "segments": [
+    {
+      "id": 1,
+      "start_time": 0.0,
+      "end_time": 5.2,
+      "type": "music",
+      "text": "Instrumental"
+    },
+    {
+      "id": 2,
+      "start_time": 5.2,
+      "end_time": 9.8,
+      "type": "lyric",
+      "text": "First line of the song"
+    }
+  ]
+}
+
+**User Lyrics:**
+${lyrics}
+
+**Whisper Transcription:**
+${whisperTranscription}
+
+Return ONLY valid JSON, no additional text.`;
+
+  let lastError: unknown;
+  for (const model of CHAT_MODELS) {
+    try {
+      const completion = await client.chat.completions.create({
+        model,
+        temperature: 0.1,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content: "You are a precise audio segmentation assistant. Always return valid JSON only.",
+          },
+          { role: "user", content: prompt },
+        ],
+      });
+
+      const content = completion.choices[0]?.message?.content ?? "";
+      return parseAlignedSegments(content);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Lyric alignment failed");
+}
+
+function parseAlignedSegments(raw: string): AlignedSegment[] {
+  const parsed = extractJson(raw) as { segments?: unknown };
+  if (!Array.isArray(parsed.segments)) {
+    throw new Error("Model did not return a segments array");
+  }
+
+  return parsed.segments.map((item, index) => {
+    const record = (item ?? {}) as Record<string, unknown>;
+    const type = record.type === "music" ? "music" : "lyric";
+    return {
+      id: Number(record.id) || index + 1,
+      start_time: Number(record.start_time),
+      end_time: Number(record.end_time),
+      type,
+      text: String(record.text ?? (type === "music" ? "Instrumental" : "")),
+    };
+  });
+}
+
+function extractJson(raw: string) {
+  const trimmed = raw.trim();
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    const match = trimmed.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error("Model returned invalid JSON");
+    return JSON.parse(match[0]) as unknown;
+  }
+}
+
+
+================================================================================
+FILE PATH: src\lib\lyrics.ts
+================================================================================
+import type { AlignedSegment, SegmentKind, WhisperSegment, WhisperWord } from "@/lib/types";
+
+const METADATA_PATTERNS = [
+  /\[.*?\]/g,
+  /\([^)]*(?:repeat|x\d+|chorus|verse|intro|outro|bridge|hook|solo|instrumental)[^)]*\)/gi,
+  /^\s*\d+[\.)]\s*/gm,
+];
+
+export function cleanLyrics(lyrics: string) {
+  let cleaned = lyrics;
+  for (const pattern of METADATA_PATTERNS) {
+    cleaned = cleaned.replace(pattern, "");
+  }
+
+  return cleaned
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+}
+
+export function formatTranscriptionForLlm(segments: WhisperSegment[], words: WhisperWord[]) {
+  if (segments.length > 0) {
+    return segments
+      .map((segment) => {
+        const start = Number(segment.start ?? 0);
+        const end = Number(segment.end ?? 0);
+        const text = (segment.text ?? "").trim();
+        return `[${start.toFixed(1)}-${end.toFixed(1)}]: "${text}"`;
+      })
+      .join("\n");
+  }
+
+  if (words.length === 0) return "";
+
+  const lines: string[] = [];
+  let bucket: WhisperWord[] = [];
+
+  for (const word of words) {
+    bucket.push(word);
+    const span = (bucket.at(-1)?.end ?? 0) - (bucket[0]?.start ?? 0);
+    if (bucket.length >= 12 || span >= 6) {
+      lines.push(formatWordBucket(bucket));
+      bucket = [];
+    }
+  }
+
+  if (bucket.length > 0) lines.push(formatWordBucket(bucket));
+  return lines.join("\n");
+}
+
+function formatWordBucket(bucket: WhisperWord[]) {
+  const start = bucket[0]?.start ?? 0;
+  const end = bucket.at(-1)?.end ?? start;
+  const text = bucket.map((word) => word.word).join("").replace(/\s+/g, " ").trim();
+  return `[${start.toFixed(1)}-${end.toFixed(1)}]: "${text}"`;
+}
+
+export function normalizeSegments(raw: AlignedSegment[], duration: number) {
+  const safeDuration = Number.isFinite(duration) && duration > 0 ? duration : inferDuration(raw);
+  const prepared = raw
+    .map((segment) => {
+      const start = clamp(Number(segment.start_time), 0, safeDuration);
+      const end = clamp(Number(segment.end_time), 0, safeDuration);
+      const type: SegmentKind = segment.type === "music" ? "music" : "lyric";
+      return {
+        id: 0,
+        start_time: Number(start.toFixed(2)),
+        end_time: Number(end.toFixed(2)),
+        type,
+        text: (segment.text || (type === "music" ? "Instrumental" : "Untitled line")).trim(),
+      } satisfies AlignedSegment;
+    })
+    .filter((segment) => segment.end_time - segment.start_time >= 0.08)
+    .sort((a, b) => a.start_time - b.start_time);
+
+  const snapped: AlignedSegment[] = [];
+  for (const segment of prepared) {
+    const previous = snapped.at(-1);
+    if (!previous) {
+      snapped.push(segment);
+      continue;
+    }
+
+    if (segment.start_time < previous.end_time) {
+      const midpoint = Number(((previous.end_time + segment.start_time) / 2).toFixed(2));
+      previous.end_time = midpoint;
+      segment.start_time = midpoint;
+    }
+
+    if (segment.end_time - segment.start_time >= 0.08) {
+      snapped.push(segment);
+    }
+  }
+
+  const withGaps = fillMusicGaps(snapped, safeDuration);
+  return withGaps.map((segment, index) => ({ ...segment, id: index + 1 }));
+}
+
+export function fillMusicGaps(segments: AlignedSegment[], duration: number) {
+  const filled: AlignedSegment[] = [];
+  let cursor = 0;
+
+  for (const segment of segments) {
+    if (segment.start_time - cursor > 1) {
+      filled.push({
+        id: 0,
+        start_time: Number(cursor.toFixed(2)),
+        end_time: Number(segment.start_time.toFixed(2)),
+        type: "music",
+        text: cursor === 0 ? "Intro" : "Instrumental",
+      });
+    }
+    filled.push(segment);
+    cursor = Math.max(cursor, segment.end_time);
+  }
+
+  if (duration - cursor > 1) {
+    filled.push({
+      id: 0,
+      start_time: Number(cursor.toFixed(2)),
+      end_time: Number(duration.toFixed(2)),
+      type: "music",
+      text: "Outro",
+    });
+  }
+
+  return filled;
+}
+
+export function alignLyricsHeuristic(
+  lyrics: string,
+  words: WhisperWord[],
+  whisperSegments: WhisperSegment[],
+  duration: number,
+) {
+  const lines = cleanLyrics(lyrics);
+  if (lines.length === 0) {
+    throw new Error("No lyric lines remain after cleaning metadata tags.");
+  }
+
+  const sourceWords = words.length > 0 ? words : wordsFromSegments(whisperSegments);
+  if (sourceWords.length === 0) {
+    throw new Error("Transcription did not include usable timestamps.");
+  }
+
+  const lyricSegments: AlignedSegment[] = [];
+  let wordIndex = 0;
+
+  for (const line of lines) {
+    const tokens = tokenize(line);
+    if (tokens.length === 0) continue;
+
+    const match = findBestWindow(sourceWords, tokens, wordIndex);
+    const startWord = sourceWords[match.start];
+    const endWord = sourceWords[match.end - 1];
+    if (!startWord || !endWord) continue;
+
+    lyricSegments.push({
+      id: 0,
+      start_time: startWord.start,
+      end_time: Math.max(endWord.end, startWord.start + 0.2),
+      type: "lyric",
+      text: line,
+    });
+    wordIndex = match.end;
+  }
+
+  return normalizeSegments(lyricSegments, duration);
+}
+
+function wordsFromSegments(segments: WhisperSegment[]): WhisperWord[] {
+  const words: WhisperWord[] = [];
+  for (const segment of segments) {
+    const pieces = (segment.text ?? "").trim().split(/\s+/).filter(Boolean);
+    if (pieces.length === 0) continue;
+    const span = Math.max(segment.end - segment.start, 0.2);
+    const step = span / pieces.length;
+    pieces.forEach((piece, index) => {
+      words.push({
+        word: piece,
+        start: segment.start + step * index,
+        end: segment.start + step * (index + 1),
+      });
+    });
+  }
+  return words;
+}
+
+function findBestWindow(words: WhisperWord[], tokens: string[], fromIndex: number) {
+  let bestStart = fromIndex;
+  let bestEnd = Math.min(words.length, fromIndex + Math.max(tokens.length, 1));
+  let bestScore = -1;
+  const searchLimit = Math.min(words.length, fromIndex + 90);
+
+  for (let start = fromIndex; start < searchLimit; start += 1) {
+    for (let length = Math.max(1, tokens.length - 2); length <= tokens.length + 4; length += 1) {
+      const end = start + length;
+      if (end > words.length) break;
+      const windowTokens = words
+        .slice(start, end)
+        .flatMap((word) => tokenize(word.word))
+        .filter(Boolean);
+      const score = similarity(tokens, windowTokens) - (start - fromIndex) * 0.008;
+      if (score > bestScore) {
+        bestScore = score;
+        bestStart = start;
+        bestEnd = end;
+      }
+    }
+  }
+
+  if (bestScore < 0.18) {
+    bestStart = fromIndex;
+    bestEnd = Math.min(words.length, fromIndex + Math.max(tokens.length, 1));
+  }
+
+  return { start: bestStart, end: Math.max(bestStart + 1, bestEnd) };
+}
+
+function similarity(expected: string[], actual: string[]) {
+  if (expected.length === 0 || actual.length === 0) return 0;
+  const actualSet = new Set(actual);
+  let hits = 0;
+  for (const token of expected) {
+    if (actualSet.has(token)) hits += 1;
+  }
+
+  let i = 0;
+  let j = 0;
+  let sequential = 0;
+  while (i < expected.length && j < actual.length) {
+    if (expected[i] === actual[j]) {
+      sequential += 1;
+      i += 1;
+      j += 1;
+    } else {
+      j += 1;
+    }
+  }
+
+  return (hits / expected.length) * 0.45 + (sequential / expected.length) * 0.55;
+}
+
+function tokenize(value: string) {
+  return value
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s']/gi, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function inferDuration(segments: AlignedSegment[]) {
+  return segments.reduce((max, segment) => Math.max(max, Number(segment.end_time) || 0), 0);
+}
+
+function clamp(value: number, min: number, max: number) {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, value));
+}
+
+
+================================================================================
+FILE PATH: src\lib\paths.ts
+================================================================================
+import { mkdir } from "fs/promises";
+import path from "path";
+
+export const DATA_ROOT = path.join(process.cwd(), "data");
+export const JOBS_ROOT = path.join(DATA_ROOT, "jobs");
+
+export function jobDir(jobId: string) {
+  return path.join(JOBS_ROOT, jobId);
+}
+
+export function segmentsDir(jobId: string) {
+  return path.join(jobDir(jobId), "segments");
+}
+
+export async function ensureJobDirs(jobId: string) {
+  await mkdir(segmentsDir(jobId), { recursive: true });
+}
+
+export { extensionOf, sanitizeFilename, titleFromFilename } from "@/lib/filenames";
+
+
+================================================================================
+FILE PATH: src\lib\process-job.ts
+================================================================================
+import { and, eq } from "drizzle-orm";
+import { db } from "@/db";
+import { jobs, segments } from "@/db/schema";
+import { createZipFromFiles, readAudioDuration, splitAudio } from "@/lib/audio";
+import { alignLyricsWithAudio, transcribeAudio } from "@/lib/groq";
+
+export async function processJob(jobId: string, apiKey: string) {
+  const existing = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
+  const job = existing[0];
+  if (!job) {
+    throw new Error("Job not found");
+  }
+
+  try {
+    await updateJob(jobId, { status: "transcribing", error: null });
+    const transcription = await transcribeAudio(apiKey, job.filePath, job.originalFilename);
+    const measuredDuration = await readAudioDuration(job.filePath).catch(() => 0);
+    const duration =
+      transcription.duration && transcription.duration > 0
+        ? transcription.duration
+        : measuredDuration;
+
+    await updateJob(jobId, {
+      transcription: transcription.text,
+      transcriptionJson: transcription as unknown as Record<string, unknown>,
+      durationSeconds: duration || null,
+      status: "aligning",
+    });
+
+    const alignment = await alignLyricsWithAudio(apiKey, job.lyrics, transcription, duration);
+
+    await db.delete(segments).where(eq(segments.jobId, jobId));
+    if (alignment.segments.length > 0) {
+      await db.insert(segments).values(
+        alignment.segments.map((segment) => ({
+          jobId,
+          index: segment.id,
+          startTime: segment.start_time,
+          endTime: segment.end_time,
+          type: segment.type,
+          text: segment.text,
+          duration: segment.end_time - segment.start_time,
+        })),
+      );
+    }
+
+    await updateJob(jobId, {
+      cleanedLyrics: alignment.cleanedLyrics,
+      alignmentSource: alignment.source,
+      segmentsCount: alignment.segments.length,
+      status: "splitting",
+    });
+
+    try {
+      const files = await splitAudio(jobId, job.filePath, alignment.segments);
+      const zipPath = await createZipFromFiles(jobId, files, `${safeZipName(job.title)}.zip`);
+
+      for (const file of files) {
+        await db
+          .update(segments)
+          .set({
+            filename: file.filename,
+            filePath: file.filepath,
+            duration: file.duration,
+          })
+          .where(and(eq(segments.jobId, jobId), eq(segments.index, file.index)));
+      }
+
+      await updateJob(jobId, {
+        status: "completed",
+        zipPath,
+        segmentsCount: files.length,
+        error: null,
+      });
+    } catch (splitError) {
+      const message = splitError instanceof Error ? splitError.message : "Audio splitting failed";
+      await updateJob(jobId, {
+        status: "completed",
+        error: `Timeline ready. Server slice failed (${message}). Use the browser WAV pack.`,
+      });
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Processing failed";
+    await updateJob(jobId, { status: "failed", error: message });
+  }
+}
+
+async function updateJob(jobId: string, values: Partial<typeof jobs.$inferInsert>) {
+  await db
+    .update(jobs)
+    .set({ ...values, updatedAt: new Date() })
+    .where(eq(jobs.id, jobId));
+}
+
+function safeZipName(title: string) {
+  return title.replace(/[<>:"/\\|?*]+/g, "").replace(/\s+/g, "_").slice(0, 40) || "segments";
+}
+
+
+================================================================================
+FILE PATH: src\lib\serialize.ts
+================================================================================
+import type { JobRow, SegmentRow } from "@/db/schema";
+import type { JobStatus, SegmentKind, SerializedJob, SerializedSegment } from "@/lib/types";
+
+export function serializeSegment(segment: SegmentRow): SerializedSegment {
+  return {
+    id: segment.id,
+    jobId: segment.jobId,
+    index: segment.index,
+    startTime: segment.startTime,
+    endTime: segment.endTime,
+    type: segment.type as SegmentKind,
+    text: segment.text,
+    filename: segment.filename,
+    filePath: segment.filePath,
+    duration: segment.duration,
+    createdAt: segment.createdAt.toISOString(),
+  };
+}
+
+export function serializeJob(job: JobRow, jobSegments?: SegmentRow[]): SerializedJob {
+  return {
+    id: job.id,
+    title: job.title,
+    originalFilename: job.originalFilename,
+    mimeType: job.mimeType,
+    lyrics: job.lyrics,
+    cleanedLyrics: job.cleanedLyrics,
+    transcription: job.transcription,
+    status: job.status as JobStatus,
+    error: job.error,
+    zipPath: job.zipPath,
+    durationSeconds: job.durationSeconds,
+    segmentsCount: job.segmentsCount,
+    alignmentSource: job.alignmentSource,
+    createdAt: job.createdAt.toISOString(),
+    updatedAt: job.updatedAt.toISOString(),
+    segments: jobSegments?.map(serializeSegment),
+  };
+}
+
+
+================================================================================
+FILE PATH: src\lib\types.ts
+================================================================================
+export type JobStatus =
+  | "uploaded"
+  | "transcribing"
+  | "aligning"
+  | "splitting"
+  | "completed"
+  | "failed";
+
+export type SegmentKind = "lyric" | "music";
+
+export type WhisperWord = {
+  word: string;
+  start: number;
+  end: number;
+};
+
+export type WhisperSegment = {
+  id?: number;
+  start: number;
+  end: number;
+  text: string;
+};
+
+export type WhisperResult = {
+  text: string;
+  words: WhisperWord[];
+  segments: WhisperSegment[];
+  duration?: number;
+};
+
+export type AlignedSegment = {
+  id: number;
+  start_time: number;
+  end_time: number;
+  type: SegmentKind;
+  text: string;
+};
+
+export type SerializedSegment = {
+  id: string;
+  jobId: string;
+  index: number;
+  startTime: number;
+  endTime: number;
+  type: SegmentKind;
+  text: string;
+  filename: string | null;
+  filePath: string | null;
+  duration: number | null;
+  createdAt: string;
+};
+
+export type SerializedJob = {
+  id: string;
+  title: string;
+  originalFilename: string;
+  mimeType: string;
+  lyrics: string;
+  cleanedLyrics: string | null;
+  transcription: string | null;
+  status: JobStatus;
+  error: string | null;
+  zipPath: string | null;
+  durationSeconds: number | null;
+  segmentsCount: number;
+  alignmentSource: string | null;
+  createdAt: string;
+  updatedAt: string;
+  segments?: SerializedSegment[];
+};
+
+
+================================================================================
+FILE PATH: tsconfig.json
+================================================================================
+{
+  "compilerOptions": {
+    "target": "ES2017",
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
+    "allowJs": false,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "react-jsx",
+    "incremental": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": [
+        "./src/*"
+      ]
+    },
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ]
+  },
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    ".next/types/**/*.ts",
+    ".next/dev/types/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}
+
+
