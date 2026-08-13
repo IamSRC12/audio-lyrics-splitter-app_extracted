@@ -70,9 +70,10 @@ export function normalizeSegments(raw: AlignedSegment[], duration: number) {
         text: (segment.text || (type === "music" ? "Instrumental" : "Untitled line")).trim(),
       } satisfies AlignedSegment;
     })
-    .filter((segment) => segment.end_time - segment.start_time >= 0.08)
+    .filter((segment) => segment.end_time - segment.start_time >= 0.05)
     .sort((a, b) => a.start_time - b.start_time);
 
+  // Fix overlaps WITHOUT merging — keep both segments, just adjust the boundary
   const snapped: AlignedSegment[] = [];
   for (const segment of prepared) {
     const previous = snapped.at(-1);
@@ -87,7 +88,8 @@ export function normalizeSegments(raw: AlignedSegment[], duration: number) {
       segment.start_time = midpoint;
     }
 
-    if (segment.end_time - segment.start_time >= 0.08) {
+    // Keep the segment even if it is short — DO NOT drop/merge it
+    if (segment.end_time > segment.start_time) {
       snapped.push(segment);
     }
   }
@@ -99,9 +101,13 @@ export function normalizeSegments(raw: AlignedSegment[], duration: number) {
 export function fillMusicGaps(segments: AlignedSegment[], duration: number) {
   const filled: AlignedSegment[] = [];
   let cursor = 0;
+  const MIN_GAP = 0.05; // fill ANY gap >= 50ms so timeline is contiguous
 
   for (const segment of segments) {
-    if (segment.start_time - cursor > 1) {
+    const gap = segment.start_time - cursor;
+
+    if (gap >= MIN_GAP) {
+      // Insert a music segment to fill the gap (keeps things contiguous)
       filled.push({
         id: 0,
         start_time: Number(cursor.toFixed(2)),
@@ -109,12 +115,18 @@ export function fillMusicGaps(segments: AlignedSegment[], duration: number) {
         type: "music",
         text: cursor === 0 ? "Intro" : "Instrumental",
       });
+    } else if (gap > 0) {
+      // Sub-50ms sliver — snap this segment's start to the cursor so there is no hole
+      segment.start_time = Number(cursor.toFixed(2));
     }
+
     filled.push(segment);
     cursor = Math.max(cursor, segment.end_time);
   }
 
-  if (duration - cursor > 1) {
+  // Trailing gap to the end of the audio
+  const trailingGap = duration - cursor;
+  if (trailingGap >= MIN_GAP) {
     filled.push({
       id: 0,
       start_time: Number(cursor.toFixed(2)),
@@ -122,6 +134,9 @@ export function fillMusicGaps(segments: AlignedSegment[], duration: number) {
       type: "music",
       text: "Outro",
     });
+  } else if (trailingGap > 0 && filled.length > 0) {
+    // Tiny tail — extend the last segment so the timeline reaches `duration`
+    filled[filled.length - 1].end_time = Number(duration.toFixed(2));
   }
 
   return filled;
