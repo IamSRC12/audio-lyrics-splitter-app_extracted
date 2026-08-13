@@ -24,93 +24,89 @@ if (process.env.NODE_ENV !== "production") {
 const realDb = drizzle(pool, { schema });
 const fallbackDb = createFallbackDb();
 
-export const db: any = new Proxy(realDb as any, {
-  get(target, prop, receiver) {
-    if (globalForDb.__useFallbackDb) {
-      return (fallbackDb as any)[prop];
+function isConnError(err: any): boolean {
+  if (!err) return false;
+  return (
+    err.code === "ECONNREFUSED" ||
+    err.syscall === "connect" ||
+    err.message?.includes("connect ECONNREFUSED") ||
+    err.cause?.code === "ECONNREFUSED"
+  );
+}
+
+function wrapDrizzleQuery(getRealQuery: () => any, getFallbackQuery: () => any): any {
+  let target: any;
+  try {
+    target = getRealQuery();
+  } catch (err) {
+    if (isConnError(err)) {
+      globalForDb.__useFallbackDb = true;
+      return getFallbackQuery();
     }
-    const realMethod = target[prop];
-    if (typeof realMethod === "function") {
-      return function (...args: any[]) {
-        try {
-          const res = realMethod.apply(target, args);
+    throw err;
+  }
 
-          const isConnError = (err: any) =>
-            err?.code === "ECONNREFUSED" ||
-            err?.syscall === "connect" ||
-            err?.message?.includes("connect ECONNREFUSED") ||
-            err?.cause?.code === "ECONNREFUSED";
+  if (!target || (typeof target !== "object" && typeof target !== "function")) {
+    return target;
+  }
 
-          if (res && typeof res.then === "function") {
-            return res.catch((err: any) => {
+  return new Proxy(target, {
+    get(obj, prop, receiver) {
+      if (prop === "then") {
+        return function (onFulfilled?: any, onRejected?: any) {
+          return Promise.resolve(obj)
+            .catch((err) => {
               if (isConnError(err)) {
                 globalForDb.__useFallbackDb = true;
-                const fallbackMethod = (fallbackDb as any)[prop];
-                if (typeof fallbackMethod === "function") {
-                  return fallbackMethod.apply(fallbackDb, args);
-                }
+                const fallbackQuery = getFallbackQuery();
+                return fallbackQuery;
               }
               throw err;
-            });
-          }
+            })
+            .then(onFulfilled, onRejected);
+        };
+      }
 
-          if (res && typeof res.from === "function") {
-            const wrapChain = (chain: any) => {
-              const originalThen = chain.then;
-              if (typeof originalThen === "function") {
-                chain.then = function (onFulfilled?: any, onRejected?: any) {
-                  return originalThen.call(chain, onFulfilled, (err: any) => {
-                    if (isConnError(err)) {
-                      globalForDb.__useFallbackDb = true;
-                      const fallbackChain = (fallbackDb as any)[prop](...args);
-                      return fallbackChain.then(onFulfilled, onRejected);
-                    }
-                    if (onRejected) return onRejected(err);
-                    throw err;
-                  });
-                };
+      const val = Reflect.get(obj, prop, receiver);
+      if (typeof val === "function") {
+        return function (...args: any[]) {
+          return wrapDrizzleQuery(
+            () => val.apply(obj, args),
+            () => {
+              const fb = getFallbackQuery();
+              const fbMethod = fb[prop];
+              if (typeof fbMethod === "function") {
+                return fbMethod.apply(fb, args);
               }
-              return chain;
-            };
-            return wrapChain(res);
-          }
+              return fb;
+            }
+          );
+        };
+      }
+      return val;
+    },
+  });
+}
 
-          if (res && typeof res.values === "function") {
-            const wrapInsertChain = (chain: any) => {
-              const originalThen = chain.then;
-              if (typeof originalThen === "function") {
-                chain.then = function (onFulfilled?: any, onRejected?: any) {
-                  return originalThen.call(chain, onFulfilled, (err: any) => {
-                    if (isConnError(err)) {
-                      globalForDb.__useFallbackDb = true;
-                      const fallbackChain = (fallbackDb as any)[prop](...args);
-                      return fallbackChain.then(onFulfilled, onRejected);
-                    }
-                    if (onRejected) return onRejected(err);
-                    throw err;
-                  });
-                };
-              }
-              return chain;
-            };
-            return wrapInsertChain(res);
-          }
-
-          return res;
-        } catch (err: any) {
-          if (
-            err?.code === "ECONNREFUSED" ||
-            err?.syscall === "connect" ||
-            err?.message?.includes("connect ECONNREFUSED") ||
-            err?.cause?.code === "ECONNREFUSED"
-          ) {
-            globalForDb.__useFallbackDb = true;
-            return (fallbackDb as any)[prop](...args);
-          }
-          throw err;
-        }
-      };
-    }
-    return Reflect.get(target, prop, receiver);
+export const db: any = {
+  select(...args: any[]) {
+    if (globalForDb.__useFallbackDb) return fallbackDb.select(...args);
+    return wrapDrizzleQuery(() => realDb.select(...args), () => fallbackDb.select(...args));
   },
-});
+  insert(...args: any[]) {
+    if (globalForDb.__useFallbackDb) return fallbackDb.insert(...args);
+    return wrapDrizzleQuery(() => realDb.insert(...args), () => fallbackDb.insert(...args));
+  },
+  update(...args: any[]) {
+    if (globalForDb.__useFallbackDb) return fallbackDb.update(...args);
+    return wrapDrizzleQuery(() => realDb.update(...args), () => fallbackDb.update(...args));
+  },
+  delete(...args: any[]) {
+    if (globalForDb.__useFallbackDb) return fallbackDb.delete(...args);
+    return wrapDrizzleQuery(() => realDb.delete(...args), () => fallbackDb.delete(...args));
+  },
+  execute(...args: any[]) {
+    if (globalForDb.__useFallbackDb) return fallbackDb.execute(...args);
+    return wrapDrizzleQuery(() => realDb.execute(...args), () => fallbackDb.execute(...args));
+  },
+};
