@@ -1,0 +1,75 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: var(--font-outfit), "Segoe UI", sans-serif;
+  --font-display: var(--font-fraunces), Georgia, serif;
+  --color-ink: #100d0a;
+  --color-ink-2: #181410;
+  --color-ink-3: #241c16;
+  --color-paper: #f3eadc;
+  --color-paper-dim: #cfc1ad;
+  --color-copper: #c57a45;
+  --color-copper-2: #e29a64;
+  --color-gold: #e3bf86;
+  --color-moss: #7f9168;
+  --color-rose: #c45d4c;
+  --color-line: rgba(243, 234, 220, 0.12);
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  background: #100d0a;
+  color: #f3eadc;
+}
+
+::selection {
+  background: #c57a45;
+  color: #100d0a;
+}
+
+textarea,
+input,
+button {
+  font: inherit;
+}
+
+.grain {
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  opacity: 0.09;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+.console-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.console-scroll::-webkit-scrollbar-thumb {
+  background: rgba(197, 122, 69, 0.4);
+  border-radius: 999px;
+}
+
+.lyric-sheet {
+  background-image:
+    linear-gradient(180deg, rgba(16, 13, 10, 0.28), rgba(16, 13, 10, 0.55)),
+    url("/images/lyrics-sheet.jpg");
+  background-size: cover;
+  background-position: center;
+}
+
+.hero-wash {
+  background-image:
+    linear-gradient(90deg, rgba(16, 13, 10, 0.82) 0%, rgba(16, 13, 10, 0.55) 42%, rgba(16, 13, 10, 0.22) 100%),
+    linear-gradient(180deg, rgba(16, 13, 10, 0.15), rgba(16, 13, 10, 0.88)),
+    url("/images/hero-mixer.jpg");
+  background-size: cover;
+  background-position: center 40%;
+}
