@@ -276,13 +276,33 @@ export function StudioApp({ initialJobs, groqConfigured }: StudioAppProps) {
                 {showKey ? "Hide Groq key field" : "Add or override Groq API key"}
               </button>
               {showKey ? (
-                <input
-                  type="password"
-                  value={apiKey}
-                  onChange={(event) => setApiKey(event.target.value)}
-                  placeholder="gsk_..."
-                  className="mt-3 w-full rounded-2xl border border-line bg-ink-2 px-4 py-3 text-sm text-paper outline-none ring-copper/40 focus:ring-2"
-                />
+                <div className="mt-3 flex items-center gap-2">
+                  <input
+                    type="password"
+                    value={apiKey}
+                    onChange={(event) => {
+                      setApiKey(event.target.value);
+                      setKeySaved(false);
+                    }}
+                    placeholder="gsk_..."
+                    className="w-full flex-1 rounded-2xl border border-line bg-ink-2 px-4 py-3 text-sm text-paper outline-none ring-copper/40 focus:ring-2"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      window.localStorage.setItem("cutline-groq-key", apiKey.trim());
+                      setKeySaved(true);
+                      setTimeout(() => setKeySaved(false), 2000);
+                    }}
+                    className={`shrink-0 rounded-2xl px-4 py-3 text-xs font-semibold uppercase tracking-[0.15em] transition active:scale-95 ${
+                      keySaved
+                        ? "bg-moss text-ink border border-moss"
+                        : "bg-copper text-ink hover:bg-copper-2"
+                    }`}
+                  >
+                    {keySaved ? "Saved ✓" : "Save"}
+                  </button>
+                </div>
               ) : null}
             </div>
           </div>
