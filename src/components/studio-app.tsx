@@ -27,6 +27,7 @@ export function StudioApp({ initialJobs, groqConfigured }: StudioAppProps) {
   const [error, setError] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState("");
   const [showKey, setShowKey] = useState(false);
+  const [keySaved, setKeySaved] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
